@@ -1,0 +1,1691 @@
+/**
+ * Odoo Online v19: 1 source DB (Projects) -> many target DBs (Documents)
+ * - Polls ir.attachment where res_model='project.task'
+ * - Routes by project.task.project_id using a Google Sheet mapping
+ * - Writes into target: ir.attachment + documents.document(folder_id)
+ *
+ * Idempotency:
+ * - target ir.attachment.description contains a unique marker:
+ *   "ODOO_SYNC|SRC_DB=<source_db>|SRC_ATT=<source_attachment_id>"
+ */
+
+/* -------------------- CONFIG -------------------- */
+
+const CFG = {
+  SOURCE: {
+    baseUrl: 'https://proseso-ventures.odoo.com',
+    db: 'proseso-ventures',
+    login: 'joseph@proseso-consulting.com',
+    password: '5172ba2c0789ca4aba51fadbdc6cabad05fab5ce'
+  },
+
+  ROUTING_SHEET_NAME: 'ProjectRouting',
+  CURSOR_KEY: 'ODOO_SYNC_LAST_CREATE_DATE_UTC',
+  ATTACHMENT_BATCH_LIMIT: 200,
+  REQUIRE_PROJECT_MAPPING: true
+};
+
+/* -------------------- Core runner -------------------- */
+
+function syncProjectTaskAttachmentsToManyTargets() {
+  const props = PropertiesService.getScriptProperties();
+
+  // Use ID cursor (reliable) instead of create_date cursor
+  const CURSOR_ID_KEY = 'ODOO_SYNC_LAST_ATTACHMENT_ID';
+  const lastId = Number(props.getProperty(CURSOR_ID_KEY) || '0');
+
+  Logger.log('=== SYNC START ===');
+  Logger.log('lastId=' + lastId);
+
+  // ✅ Auto-refresh routing from Odoo BEFORE loading routing map
+try {
+  refreshProjectRoutingFromOdoo_ApprovedDoneTaxPH();
+} catch (e) {
+  Logger.log('⚠️ refreshProjectRouting failed (continuing): ' + (e && e.message ? e.message : e));
+}
+
+const routing = loadRoutingMap_(); // MUST include route.target_company_id
+Logger.log('routingRows=' + Object.keys(routing).length);
+
+  Logger.log('routingKeys=' + JSON.stringify(Object.keys(routing)));
+Logger.log('routingRowSample=' + JSON.stringify(routing[Object.keys(routing)[0]]));
+
+
+  // after: const routing = loadRoutingMap_();
+  const allowedProjectsByTarget = new Map(); // key -> [source_project_id...]
+
+  for (const [spid, r] of Object.entries(routing)) {
+    const k = [r.target_base_url, r.target_db, r.target_login, String(r.target_company_id)].join('|');
+    if (!allowedProjectsByTarget.has(k)) allowedProjectsByTarget.set(k, []);
+    allowedProjectsByTarget.get(k).push(Number(spid));
+  }
+
+  // -------------------- helpers --------------------
+  const m2oId = (v) => {
+    if (v === null || v === undefined || v === '' || v === false) return false;
+    if (Array.isArray(v)) return v.length ? m2oId(v[0]) : false;
+    if (typeof v === 'object') return ('id' in v) ? m2oId(v.id) : false;
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : false;
+  };
+
+  const requireId = (v, ctx) => {
+    const id = m2oId(v);
+    if (!id) throw new Error('Invalid ID: ' + JSON.stringify({ got: v, ctx: ctx || {} }));
+    return id;
+  };
+
+  const monthNameFromMM = (mm) => {
+    const map = {
+      '01':'January','02':'February','03':'March','04':'April','05':'May','06':'June',
+      '07':'July','08':'August','09':'September','10':'October','11':'November','12':'December'
+    };
+    return map[String(mm).padStart(2,'0')] || String(mm);
+  };
+
+  // Tax name + [period] parsing
+  const parseTaxAndPeriodFromTaskName_ = (taskName) => {
+    const raw = String(taskName || '').trim();
+
+    // first [...]
+    const bracket = raw.match(/\[([^\]]+)\]/);
+    const bracketVal = bracket ? String(bracket[1]).trim() : '';
+
+    // tax name: remove all [..], remove leading "Tax PH"
+    let taxName = raw.replace(/\[[^\]]*\]/g, '').trim();
+    taxName = taxName.replace(/^Tax PH\s*[-:–—]*\s*/i, '').trim();
+    if (!taxName) taxName = 'Tax';
+
+    // period
+    // [YYYY.MM]
+    let m = bracketVal.match(/\b(20\d{2})\.(0[1-9]|1[0-2])\b/);
+    if (m) return { taxName, year: m[1], monthName: monthNameFromMM(m[2]) };
+
+    // [YYYY]
+    m = bracketVal.match(/\b(20\d{2})\b/);
+    if (m) return { taxName, year: m[1], monthName: null };
+
+    // If no bracket, DO NOT invent month/year folders.
+    return { taxName, year: null, monthName: null };
+  };
+
+  // Ensure all target calls run under the intended company context
+  const kwWithCompany = (companyId, extraKw) => Object.assign(
+    { context: { allowed_company_ids: [companyId], force_company: companyId } },
+    extraKw || {}
+  );
+
+  const assertFolderDoc_ = (targetCfg, companyId, docId, ctx) => {
+    const id = requireId(docId, { where: 'assertFolderDoc_', ...ctx });
+    const rows = odooExecuteKw_(
+      targetCfg,
+      'documents.document', 'read',
+      [[id], ['id','name','type','is_folder','folder_id','company_id','owner_id']],
+      kwWithCompany(companyId)
+    ) || [];
+    const d = rows[0];
+    if (!d) throw new Error('Folder doc not found: ' + JSON.stringify({ id, ctx: ctx || {} }));
+    const isFolder = (String(d.type || '').toLowerCase() === 'folder') || !!d.is_folder;
+    if (!isFolder) throw new Error('Resolved folder is not a folder: ' + JSON.stringify({ got: d, ctx: ctx || {} }));
+    return id;
+  };
+
+  // Never duplicates: if folder exists under same parent, reuse it.
+  const findOrCreateFolder_ = (targetCfg, companyId, name, parentFolderIdOrFalse) => {
+    const parentId = (parentFolderIdOrFalse === false)
+      ? false
+      : requireId(parentFolderIdOrFalse, { where: 'findOrCreateFolder_', name });
+
+    // Search ONLY folders by (name, parent) within the same company context
+    const ids = odooExecuteKw_(
+      targetCfg,
+      'documents.document', 'search',
+      [[
+        ['name', '=', String(name)],
+        ['type', '=', 'folder'],
+        ['folder_id', '=', parentId]
+      ]],
+      kwWithCompany(companyId, { limit: 1 })
+    ) || [];
+
+    if (ids.length) return requireId(ids[0], { where: 'folder existing', name, parentId });
+
+    // Create only if not found
+    const createdId = odooExecuteKw_(
+      targetCfg,
+      'documents.document', 'create',
+      [[{
+        name: String(name),
+        type: 'folder',
+        is_folder: true,
+        folder_id: parentId,
+        company_id: companyId,
+        owner_id: false
+      }]],
+      kwWithCompany(companyId)
+    );
+
+    return requireId(createdId, { where: 'folder created', name, parentId });
+  };
+
+
+
+  // Default path (no bucket): Taxes / [Year] / [Month]
+  const ensureTaxPathFolder_ = (targetCfg, companyId, yearOrNull, monthNameOrNull) => {
+    const taxesRoot = findOrCreateFolder_(targetCfg, companyId, 'Taxes', false);
+
+    if (!yearOrNull) return taxesRoot;
+
+    const yearFolder = findOrCreateFolder_(targetCfg, companyId, String(yearOrNull), taxesRoot);
+
+    if (monthNameOrNull) {
+      return findOrCreateFolder_(targetCfg, companyId, String(monthNameOrNull), yearFolder);
+    }
+    return yearFolder;
+  };
+
+  
+
+  // --- NEW: folder bucket mapping based on upload field (res_field) ---
+  // Path for bucketed uploads: Taxes / [Year] / <Bucket> / [Month]
+  const FIELD_TO_TAX_BUCKET = {
+    'x_studio_tax_ph_documents': 'VAT',
+    'x_studio_many2many_field_7t8_1jbplpmld': 'Expanded Withholding Tax',
+    'x_studio_wtc': 'Withholding Tax on Compensation',
+    'x_studio_itr': 'Income Tax',
+    'x_studio_other_tax_documents': 'Others'
+    // add more here:
+    // 'x_studio_bir_forms': 'BIR',
+  };
+
+  const getTaxBucketFromResField_ = (resField) => {
+    const f = String(resField || '').trim();
+    return FIELD_TO_TAX_BUCKET[f] || null;
+  };
+
+  const ensureBucketTaxPathFolder_ = (targetCfg, companyId, bucketName, yearOrNull, monthNameOrNull) => {
+    const taxesRoot = findOrCreateFolder_(targetCfg, companyId, 'Taxes', false);
+
+    // If no year, we can't do Taxes/Year/VAT — fallback to Taxes/VAT
+    if (!yearOrNull) {
+      return findOrCreateFolder_(targetCfg, companyId, String(bucketName), taxesRoot);
+    }
+
+    const yearFolder = findOrCreateFolder_(targetCfg, companyId, String(yearOrNull), taxesRoot);
+    const bucketFolder = findOrCreateFolder_(targetCfg, companyId, String(bucketName), yearFolder);
+
+    if (monthNameOrNull) {
+      return findOrCreateFolder_(targetCfg, companyId, String(monthNameOrNull), bucketFolder);
+    }
+    return bucketFolder;
+  };
+
+  // One documents.document per attachment_id (unique). Move if exists; force company drive.
+  const upsertMoveDocumentForAttachment_ = (targetCfg, companyId, attachmentId, destFolderId, docName) => {
+  const attId = requireId(attachmentId, { where: 'upsertMoveDocumentForAttachment_' });
+  const folderId = assertFolderDoc_(targetCfg, companyId, destFolderId, { where: 'upsertMoveDocumentForAttachment_', attId });
+
+  // Check if doc already exists for this attachment
+  const docIds = odooExecuteKw_(
+    targetCfg,
+    'documents.document', 'search',
+    [[['attachment_id', '=', attId]]],
+    kwWithCompany(companyId, { limit: 5 })
+  ) || [];
+
+  Logger.log(JSON.stringify({
+    stage: 'doc_search',
+    attId,
+    folderId,
+    docIds
+  }));
+
+  if (docIds.length) {
+    const docId = requireId(docIds[0], { where: 'doc existing', attId });
+
+    const ok = odooExecuteKw_(
+      targetCfg,
+      'documents.document', 'write',
+      [[docId], {
+        folder_id: folderId,
+        name: String(docName || 'Document'),
+        company_id: companyId,
+        owner_id: false
+      }],
+      kwWithCompany(companyId)
+    );
+
+    Logger.log(JSON.stringify({ stage: 'doc_write', docId, ok, folderId, companyId }));
+
+    // read back to confirm where it landed
+    const back = odooExecuteKw_(
+      targetCfg,
+      'documents.document', 'read',
+      [[docId], ['id','name','folder_id','company_id','owner_id','type']],
+      kwWithCompany(companyId)
+    ) || [];
+    Logger.log(JSON.stringify({ stage: 'doc_after_write', back: back[0] || null }));
+
+    return { action: 'moved', doc_id: docId };
+  }
+
+  const createdDocId = odooExecuteKw_(
+    targetCfg,
+    'documents.document', 'create',
+    [[{
+      name: String(docName || 'Document'),
+      folder_id: folderId,
+      attachment_id: attId,
+      company_id: companyId,
+      owner_id: false
+    }]],
+    kwWithCompany(companyId)
+  );
+
+  const docId = requireId(createdDocId, { where: 'doc create', attId });
+
+  Logger.log(JSON.stringify({ stage: 'doc_create', docId, folderId, companyId }));
+
+  // read back to confirm where it landed
+  const back = odooExecuteKw_(
+    targetCfg,
+    'documents.document', 'read',
+    [[docId], ['id','name','folder_id','company_id','owner_id','type']],
+    kwWithCompany(companyId)
+  ) || [];
+  Logger.log(JSON.stringify({ stage: 'doc_after_create', back: back[0] || null }));
+
+  return { action: 'created', doc_id: docId };
+};
+
+
+  // -------------------- 1) Fetch attachments from SOURCE by ID cursor --------------------
+  const domain = [
+    ['res_model', '=', 'project.task'],
+    ['type', '=', 'binary'],
+    ['id', '>', lastId]
+  ];
+
+  const attIds = odooExecuteKw_(
+    CFG.SOURCE,
+    'ir.attachment', 'search',
+    [domain],
+    { limit: CFG.ATTACHMENT_BATCH_LIMIT, order: 'id asc' }
+  ) || [];
+
+  const metrics = {
+    nAttIds: attIds.length,
+    nAttRead: 0,
+    nTasks: 0,
+    nSkipNoProject: 0,
+    nSkipNoRoute: 0,
+    nSkipNotTax: 0,
+    nProcessed: 0,
+    nCreatedOrMoved: 0
+  };
+
+  if (!attIds.length) {
+    Logger.log('No new attachments > lastId. Running GC only...');
+
+    // -------------------- 4) GC pass: delete in target if removed from source task --------------------
+    let gcScanned = 0, gcDeleted = 0;
+
+    for (const [spid, route] of Object.entries(routing)) {
+      const targetCfg2 = {
+        baseUrl: route.target_base_url,
+        db: route.target_db,
+        login: route.target_login,
+        password: route.target_password
+      };
+      const companyId2 = requireId(route.target_company_id, { where: 'route.target_company_id', source_project_id: spid });
+
+      const allowed = [];
+      for (const [spid2, r2] of Object.entries(routing)) {
+        if (
+          r2.target_base_url === route.target_base_url &&
+          r2.target_db === route.target_db &&
+          r2.target_login === route.target_login &&
+          String(r2.target_company_id) === String(route.target_company_id)
+        ) {
+          allowed.push(Number(spid2));
+        }
+      }
+
+      const res = syncDeletionsForTarget_(targetCfg2, companyId2, allowed);
+      gcScanned += res.scanned;
+      gcDeleted += res.deleted;
+    }
+
+    Logger.log('GC: scanned=' + gcScanned + ' deleted=' + gcDeleted);
+
+    Logger.log(JSON.stringify(metrics, null, 2));
+    Logger.log('=== SYNC END ===');
+    return;
+  }
+
+  // IMPORTANT: include res_field so we can route by upload field
+  const atts = odooExecuteKw_(
+    CFG.SOURCE,
+    'ir.attachment', 'read',
+    [attIds, ['id','name','mimetype','res_id','res_field','create_date']],
+    {}
+  ) || [];
+  metrics.nAttRead = atts.length;
+
+  // -------------------- 2) Read tasks (bulk) --------------------
+const taskIds = [...new Set(atts.map(a => a.res_id).filter(Boolean))];
+
+// ✅ Stage name is EXACTLY "Approved / Done"
+const ALLOWED_STAGE_NAME = 'APPROVED / DONE';
+
+
+const tasks = taskIds.length
+  ? (odooExecuteKw_(
+      CFG.SOURCE,
+      'project.task',
+      'read',
+      [taskIds, ['id','project_id','name','stage_id']],
+      {}
+    ) || [])
+  : [];
+metrics.nTasks = tasks.length;
+
+
+  // ---- Build map: source attachment id -> bucket (works for M2M upload fields) ----
+const TAX_BUCKET_FIELDS = Object.keys(FIELD_TO_TAX_BUCKET); // your studio fields
+
+// Read the bucket fields for all tasks we’re touching
+const tasksWithBuckets = taskIds.length
+  ? (odooExecuteKw_(
+      CFG.SOURCE,
+      'project.task', 'read',
+      [taskIds, ['id', ...TAX_BUCKET_FIELDS]],
+      {}
+    ) || [])
+  : [];
+
+// Map source attachment id -> bucket name
+const bucketBySourceAttId = new Map();
+
+for (const t of tasksWithBuckets) {
+  for (const fieldName of TAX_BUCKET_FIELDS) {
+    const bucketName = FIELD_TO_TAX_BUCKET[fieldName];
+    const ids = t[fieldName]; // in Odoo JSON-RPC, M2M fields usually come back as [id,id,...]
+    if (!Array.isArray(ids) || !ids.length) continue;
+
+    for (const attId of ids) {
+      // only set if not already set (first match wins)
+      if (!bucketBySourceAttId.has(attId)) bucketBySourceAttId.set(attId, bucketName);
+    }
+  }
+}
+
+Logger.log(`bucketBySourceAttId size=${bucketBySourceAttId.size}`);
+
+
+  const taskToProject = new Map();
+const taskToName = new Map();
+const taskToStageName = new Map(); // ✅ NEW
+
+for (const t of tasks) {
+  const pid = Array.isArray(t.project_id) ? t.project_id[0] : t.project_id;
+  taskToProject.set(t.id, pid);
+  taskToName.set(t.id, t.name || '');
+
+  // stage_id is M2O: [id, "Name"]
+  const st = t.stage_id;
+  const stName = Array.isArray(st) ? String(st[1] || '') : '';
+  taskToStageName.set(t.id, stName);
+}
+
+
+  // -------------------- 3) Process each attachment --------------------
+  const failures = [];
+  let maxSeenId = lastId;
+
+  for (const a of atts) {
+    maxSeenId = Math.max(maxSeenId, Number(a.id) || 0);
+
+    const pid = taskToProject.get(a.res_id);
+    if (!pid) {
+      metrics.nSkipNoProject++;
+      failures.push({ reason: 'No project_id for task', attachment_id: a.id, task_id: a.res_id, file: a.name });
+      continue;
+    }
+
+    const route = routing[String(pid)];
+    if (!route) {
+      metrics.nSkipNoRoute++;
+      failures.push({ reason: 'No routing for project', project_id: pid, attachment_id: a.id, task_id: a.res_id, file: a.name });
+      continue;
+    }
+
+    const taskName = taskToName.get(a.res_id) || '';
+const stageName = String(taskToStageName.get(a.res_id) || '').trim();
+const stageUp = stageName.toUpperCase();
+
+// ✅ Only handle stage EXACTLY "Approved / Done"
+if (stageUp !== ALLOWED_STAGE_NAME) {
+  continue;
+}
+
+
+// require BOTH "Tax PH" and a bracket period like [2026.01] or [2026]
+const hasTax = /Tax PH/i.test(taskName);
+const hasBracketPeriod = /\[(20\d{2})(\.(0[1-9]|1[0-2]))?\]/.test(taskName);
+
+if (!hasTax || !hasBracketPeriod) {
+  metrics.nSkipNotTax++;
+  continue;
+}
+
+
+    const targetCfg = {
+      baseUrl: route.target_base_url,
+      db: route.target_db,
+      login: route.target_login,
+      password: route.target_password
+    };
+
+    const companyId = requireId(route.target_company_id, { where: 'route.target_company_id', project_id: pid });
+
+    const marker = `ODOO_SYNC|SRC_DB=${CFG.SOURCE.db}|SRC_ATT=${a.id}`;
+
+    // A) upsert target ir.attachment by marker
+    const existingAttIds = odooExecuteKw_(
+      targetCfg,
+      'ir.attachment', 'search',
+      [[['description', '=', marker]]],
+      { limit: 1 }
+    ) || [];
+
+    let targetAttachmentId;
+    if (existingAttIds.length) {
+      targetAttachmentId = requireId(existingAttIds[0], { where: 'existing target attachment' });
+    } else {
+      // fetch datas only now
+      const srcBin = odooExecuteKw_(CFG.SOURCE, 'ir.attachment', 'read', [[a.id], ['datas']], {}) || [];
+      const datas = srcBin[0] && srcBin[0].datas ? srcBin[0].datas : null;
+      if (!datas) {
+        failures.push({ reason: 'Missing datas from source attachment', attachment_id: a.id, task_id: a.res_id, file: a.name });
+        continue;
+      }
+
+      targetAttachmentId = odooExecuteKw_(
+        targetCfg,
+        'ir.attachment', 'create',
+        [[{
+          name: a.name,
+          mimetype: a.mimetype || 'application/octet-stream',
+          datas: datas,
+          type: 'binary',
+          description: marker
+        }]],
+        {}
+      );
+      targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
+    }
+
+    // B) folder path:
+    // - If uploaded via mapped Studio field, route: Taxes / [Year] / VAT / [Month]
+    // - Else fallback: Taxes / [Year] / [Month]
+    const parsed = parseTaxAndPeriodFromTaskName_(taskName);
+    Logger.log(JSON.stringify({
+  att_id: a.id,
+  name: a.name,
+  res_model: 'project.task',
+  res_id: a.res_id,
+  res_field: a.res_field,
+  taskName: taskName
+}));
+
+    const bucket = bucketBySourceAttId.get(a.id) || getTaxBucketFromResField_(a.res_field);
+
+Logger.log(JSON.stringify({
+  src_att_id: a.id,
+  res_field: a.res_field,
+  bucket_detected: bucket,
+  taskName,
+  year: parsed.year,
+  monthName: parsed.monthName
+}));
+
+
+    const destFolderId = bucket
+      ? ensureBucketTaxPathFolder_(targetCfg, companyId, bucket, parsed.year, parsed.monthName)
+      : ensureTaxPathFolder_(targetCfg, companyId, parsed.year, parsed.monthName);
+
+    // C) create/move document
+    try {
+      metrics.nProcessed++;
+      const res = upsertMoveDocumentForAttachment_(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+      if (res) metrics.nCreatedOrMoved++;
+    } catch (e) {
+      failures.push({
+        reason: 'documents upsert/move failed',
+        attachment_id: a.id,
+        target_attachment_id: targetAttachmentId,
+        task_id: a.res_id,
+        file: a.name,
+        err: String(e && e.message ? e.message : e),
+        ctx: { parsed, destFolderId, companyId, res_field: a.res_field, bucket }
+      });
+    }
+  }
+
+  // -------------------- 4) GC pass: delete in target if removed from source task --------------------
+  let gcScanned = 0, gcDeleted = 0;
+
+  for (const [spid, route] of Object.entries(routing)) {
+    const targetCfg2 = {
+      baseUrl: route.target_base_url,
+      db: route.target_db,
+      login: route.target_login,
+      password: route.target_password
+    };
+    const companyId2 = requireId(route.target_company_id, { where: 'route.target_company_id', source_project_id: spid });
+
+    // allowed source projects that map to THIS exact target+company (prevents wrong-target leftovers)
+    const allowed = [];
+    for (const [spid2, r2] of Object.entries(routing)) {
+      if (
+        r2.target_base_url === route.target_base_url &&
+        r2.target_db === route.target_db &&
+        r2.target_login === route.target_login &&
+        String(r2.target_company_id) === String(route.target_company_id)
+      ) {
+        allowed.push(Number(spid2));
+      }
+    }
+
+    const res = syncDeletionsForTarget_(targetCfg2, companyId2, allowed);
+    gcScanned += res.scanned;
+    gcDeleted += res.deleted;
+  }
+
+  Logger.log('GC: scanned=' + gcScanned + ' deleted=' + gcDeleted);
+
+  // Advance ID cursor ONLY if we processed some attachments
+  props.setProperty(CURSOR_ID_KEY, String(maxSeenId));
+
+  Logger.log('=== SYNC END ===');
+  Logger.log(JSON.stringify(metrics, null, 2));
+
+  if (failures.length) {
+    Logger.log('Failures:\n' + JSON.stringify(failures, null, 2));
+  }
+}
+
+
+
+/* -------------------- Routing map loader -------------------- */
+
+function loadRoutingMap_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(CFG.ROUTING_SHEET_NAME);
+  if (!sh) throw new Error(`Missing sheet: ${CFG.ROUTING_SHEET_NAME}`);
+
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const header = values[0].map(String);
+  const idx = {};
+  header.forEach((h, i) => (idx[h.trim()] = i));
+
+  const required = [
+  'enabled','source_project_id',
+  'target_base_url','target_db','target_login','target_password',
+  'target_company_id'
+];
+
+  for (const r of required) if (idx[r] == null) throw new Error(`Routing sheet missing column: ${r}`);
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const enabled = String(row[idx.enabled]).toUpperCase() === 'TRUE';
+    if (!enabled) continue;
+
+    const spid = String(row[idx.source_project_id]).trim();
+    if (!spid) continue;
+
+    const target_base_url = String(row[idx.target_base_url]).trim();
+const target_db = String(row[idx.target_db]).trim();
+const target_login = String(row[idx.target_login]).trim();
+const target_password = String(row[idx.target_password]).trim();
+const target_company_id = String(row[idx.target_company_id]).trim();
+
+// ✅ Skip rows that are enabled but still incomplete
+if (!target_base_url || !target_db) {
+  continue;
+}
+
+
+map[spid] = {
+  target_base_url,
+  target_db,
+  target_login,
+  target_password,
+  target_company_id
+};
+
+  }
+  return map;
+}
+
+/* -------------------- Odoo JSON-RPC helpers (/jsonrpc execute_kw) -------------------- */
+
+const ODOO_UID_CACHE = new Map();
+
+function odooAuthenticateUid_(cfg) {
+  const key = `${cfg.baseUrl}|${cfg.db}|${cfg.login}`;
+  if (ODOO_UID_CACHE.has(key)) return ODOO_UID_CACHE.get(key);
+
+  const endpoint = cfg.baseUrl.replace(/\/$/, '') + '/jsonrpc';
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'call',
+    params: { service: 'common', method: 'authenticate', args: [cfg.db, cfg.login, cfg.password, {}] },
+    id: 1
+  };
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const txt = res.getContentText() || '{}';
+  const data = JSON.parse(txt);
+
+  if (data.error) throw new Error(`Odoo auth error baseUrl=${cfg.baseUrl} db=${cfg.db} login=${cfg.login} :: ${JSON.stringify(data.error)}`);
+
+  const uid = data.result;
+  if (!uid) throw new Error(`Odoo auth failed (uid falsy) baseUrl=${cfg.baseUrl} db=${cfg.db} login=${cfg.login} :: ${txt}`);
+
+  ODOO_UID_CACHE.set(key, uid);
+  return uid;
+}
+
+function odooExecuteKw_(cfg, model, method, args, kwargs) {
+  const uid = odooAuthenticateUid_(cfg);
+  const endpoint = cfg.baseUrl.replace(/\/$/, '') + '/jsonrpc';
+
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'call',
+    params: {
+      service: 'object',
+      method: 'execute_kw',
+      args: [cfg.db, uid, cfg.password, model, method, args || [], kwargs || {}]
+    },
+    id: 2
+  };
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const txt = res.getContentText() || '{}';
+  const data = JSON.parse(txt);
+
+  if (data.error) {
+    throw new Error(`Odoo execute_kw error ${model}.${method} baseUrl=${cfg.baseUrl} db=${cfg.db} login=${cfg.login} :: ${JSON.stringify(data.error)}`);
+  }
+  return data.result;
+}
+
+function m2oId_(v) {
+  if (v === null || v === undefined || v === '' || v === false) return false;
+  if (Array.isArray(v)) return v[0];
+  const n = Number(v);
+  return isNaN(n) ? false : n;
+}
+
+function normalizeOdooBaseUrl_(raw) {
+  if (isFalsyOdooValue_(raw)) return '';
+
+  let s = String(raw || '').trim();
+  if (!s) return '';
+
+  // If a DB name is passed instead of URL (e.g., "proseso-accounting-test")
+  if (!/^https?:\/\//i.test(s) && /^[a-z0-9-]+$/i.test(s)) {
+    // Guard: db="false" should not become https://false.odoo.com/
+    if (s.toLowerCase() === 'false') return '';
+    s = `https://${s}.odoo.com/`;
+  }
+
+  // Force https
+  s = s.replace(/^http:\/\//i, 'https://');
+
+  // Remove trailing "/odoo" or "/odoo/" AFTER .odoo.com
+  s = s.replace(/(\.odoo\.com)\/odoo\/?$/i, '$1/');
+
+  // Ensure trailing slash
+  if (!s.endsWith('/')) s += '/';
+
+  // If it normalized into https://false.odoo.com/ treat as blank
+  if (/^https:\/\/false\.odoo\.com\/$/i.test(s)) return '';
+
+  return s;
+}
+
+
+function deriveDbFromBaseUrl_(baseUrl) {
+  if (isFalsyOdooValue_(baseUrl)) return '';
+  const s = String(baseUrl || '').trim();
+  const m = s.match(/^https:\/\/([a-z0-9-]+)\.odoo\.com\b/i);
+  if (!m) return '';
+  const db = (m[1] || '').trim();
+  if (!db || db.toLowerCase() === 'false') return '';
+  return db;
+}
+
+
+/**
+ * AUTO-POPULATE ProjectRouting based on Odoo:
+ * - Include a project if it has at least one "Tax PH" task in Approved/Done stage
+ * - Fill:
+ *    source_project_id (if row exists or create new row)
+ *    Company (project.project.name)
+ *    target_base_url + target_db from x_studio_accounting_database on task named "General" in that project
+ *
+ * IMPORTANT:
+ * - This function only writes to the routing sheet. It does NOT run the attachment sync.
+ */
+function refreshProjectRoutingFromOdoo_ApprovedDoneTaxPH() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(CFG.ROUTING_SHEET_NAME);
+  if (!sh) throw new Error(`Missing sheet: ${CFG.ROUTING_SHEET_NAME}`);
+
+  const values = sh.getDataRange().getValues();
+  if (values.length < 1) throw new Error('ProjectRouting has no header row.');
+
+  const header = values[0].map(h => String(h || '').trim());
+  const idx = {};
+  header.forEach((h, i) => idx[h] = i);
+
+  // Required columns you said you want auto-managed
+const needCols = [
+  'source_project_id','Company',
+  'target_base_url','target_db'
+];
+
+  needCols.forEach(c => {
+    if (idx[c] == null) throw new Error(`ProjectRouting missing column: ${c}`);
+  });
+
+  // ✅ Routing gets populated if there is a Tax PH task in "Master"
+const ROUTING_STAGE_NAME = 'Master';
+
+const taxTasks = odooExecuteKw_(
+  CFG.SOURCE,
+  'project.task',
+  'search_read',
+  [[
+    ['name', 'ilike', 'Tax PH'],
+    ['stage_id.name', '=', ROUTING_STAGE_NAME]
+  ], ['id','project_id']],
+  { limit: 500, order: 'id desc' }
+) || [];
+
+
+  const projectIds = [...new Set(
+    taxTasks
+      .map(t => Array.isArray(t.project_id) ? t.project_id[0] : null)
+      .filter(Boolean)
+      .map(n => Number(n))
+      .filter(n => Number.isFinite(n) && n > 0)
+  )];
+
+  if (!projectIds.length) {
+    Logger.log('refreshProjectRouting: no projects found with Tax PH in Master.');
+    return { ok: true, updated: 0, added: 0, projectIds: [] };
+  }
+
+  // 2) Read project names for Company column
+  const projects = odooExecuteKw_(
+    CFG.SOURCE,
+    'project.project',
+    'read',
+    [projectIds, ['id','name']],
+    {}
+  ) || [];
+  const projectNameById = new Map(projects.map(p => [Number(p.id), String(p.name || '')]));
+
+  // 3) For each project, read the "General" task to get x_studio_accounting_database
+  // You said: "within task named General within that project"
+  const generalTasks = odooExecuteKw_(
+    CFG.SOURCE,
+    'project.task',
+    'search_read',
+    [[
+      ['project_id', 'in', projectIds],
+      ['name', '=', 'General']
+    ], ['id','project_id','x_studio_accounting_database']],
+    { limit: projectIds.length * 5 }
+  ) || [];
+
+  const acctDbByProjectId = new Map(); // pid -> raw field value
+  generalTasks.forEach(t => {
+    const pid = Array.isArray(t.project_id) ? Number(t.project_id[0]) : null;
+    if (!pid) return;
+    if (!acctDbByProjectId.has(pid)) acctDbByProjectId.set(pid, t.x_studio_accounting_database);
+  });
+
+  // 4) Parse x_studio_accounting_database into {target_base_url, target_db}
+  // NO EXTRAPOLATION: strict parsing rules only.
+  const parseAcctDb = (raw) => {
+  if (isFalsyOdooValue_(raw)) return { target_base_url: '', target_db: '' };
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return { target_base_url: '', target_db: '' };
+
+  // Case A: JSON string {"baseUrl":"..."} or {"target_base_url":"..."} or {"db":"..."}
+  if (s.startsWith('{') && s.endsWith('}')) {
+    try {
+      const o = JSON.parse(s);
+      const bu = normalizeOdooBaseUrl_(o.baseUrl || o.target_base_url || '');
+      const db = bu ? deriveDbFromBaseUrl_(bu) : (String(o.db || o.target_db || '').trim());
+      const bu2 = bu || normalizeOdooBaseUrl_(db);
+      return { target_base_url: bu2, target_db: deriveDbFromBaseUrl_(bu2) };
+    } catch (_) {
+      return { target_base_url: '', target_db: '' };
+    }
+  }
+
+  // Case B: URL directly (maybe ends with /odoo)
+  if (/^https?:\/\//i.test(s)) {
+    const bu = normalizeOdooBaseUrl_(s);
+    return { target_base_url: bu, target_db: deriveDbFromBaseUrl_(bu) };
+  }
+
+  // Case C: DB name only ("proseso-accounting-test")
+  const bu = normalizeOdooBaseUrl_(s); // turns DB -> https://DB.odoo.com/
+  return { target_base_url: bu, target_db: deriveDbFromBaseUrl_(bu) };
+};
+
+
+  // 5) Index existing rows by source_project_id
+  const rowByProjectId = new Map(); // pid -> rowIndex (0-based in values)
+  for (let r = 1; r < values.length; r++) {
+    const pid = Number(values[r][idx.source_project_id] || 0);
+    if (pid) rowByProjectId.set(pid, r);
+  }
+
+  let updated = 0, added = 0;
+
+  // Helper to ensure a row exists for pid
+  const ensureRowForProject = (pid) => {
+    if (rowByProjectId.has(pid)) return rowByProjectId.get(pid);
+
+    const newRow = Array(values[0].length).fill('');
+newRow[idx.source_project_id] = String(pid);
+// ✅ DO NOT touch enabled — user sets it manually
+
+
+    values.push(newRow);
+    const newIdx = values.length - 1;
+    rowByProjectId.set(pid, newIdx);
+    added++;
+    return newIdx;
+  };
+
+  // 6) Apply updates for all qualifying projects
+  projectIds.forEach(pid => {
+    const r = ensureRowForProject(pid);
+
+    // enabled
+    
+
+    // Company
+    values[r][idx.Company] = projectNameById.get(pid) || '';
+
+    // target_base_url / target_db
+    const rawAcct = acctDbByProjectId.get(pid);
+    const parsed = parseAcctDb(rawAcct);
+
+    // --- Clean existing sheet values (FALSE / false / https://false.odoo.com/ => blank) ---
+const curBuRaw = String(values[r][idx.target_base_url] || '').trim();
+const curDbRaw = String(values[r][idx.target_db] || '').trim();
+
+// normalize/clear base url
+let bu = normalizeOdooBaseUrl_(curBuRaw);
+
+// IMPORTANT: if normalize returned '', we MUST clear the cell (this removes https://false.odoo.com/)
+if (!bu) values[r][idx.target_base_url] = '';
+
+// normalize/clear db
+let db = isFalsyOdooValue_(curDbRaw) ? '' : curDbRaw;
+if (!db) values[r][idx.target_db] = ''; // clears "FALSE"
+
+// --- Apply Odoo parsed value ONLY if sheet base_url is blank ---
+if (!bu && parsed.target_base_url) {
+  bu = normalizeOdooBaseUrl_(parsed.target_base_url);
+  values[r][idx.target_base_url] = bu || ''; // if parsed was false-ish, keep blank
+}
+
+// --- Derive db ONLY from a valid base_url (and only if db cell is blank) ---
+if (!db && bu) {
+  const derived = deriveDbFromBaseUrl_(bu);
+  values[r][idx.target_db] = derived || ''; // derived could be '' if bu was invalid
+}
+
+
+
+
+    updated++;
+  });
+
+  // 7) Write back
+  sh.getRange(1, 1, values.length, values[0].length).setValues(values);
+
+  Logger.log(`refreshProjectRouting: updated=${updated}, added=${added}, projects=${projectIds.length}`);
+  return { ok: true, updated, added, projectIds };
+}
+
+
+/* -------------------- Trigger setup -------------------- */
+
+function installSyncTriggerEvery5Min() {
+  const fn = 'syncProjectTaskAttachmentsToManyTargets';
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) if (t.getHandlerFunction() === fn) ScriptApp.deleteTrigger(t);
+  ScriptApp.newTrigger(fn).timeBased().everyMinutes(5).create();
+}
+
+/* -------------------- Task name parsing (Year/Month) -------------------- */
+
+function parseYearMonthFromTaskName_(taskName, fallbackUtc) {
+  const s = String(taskName || '').trim();
+
+  let m = s.match(/\b(20\d{2})[-\/](0[1-9]|1[0-2])\b/);
+  if (m) return { year: m[1], month: m[2] };
+
+  m = s.match(/\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(20\d{2})\b/i);
+  if (m) {
+    const map = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+    const mon = map[m[1].slice(0,3).toLowerCase()];
+    return { year: m[2], month: mon };
+  }
+
+  const dt = parseOdooUtc_(fallbackUtc);
+  const year = Utilities.formatDate(dt, 'UTC', 'yyyy');
+  const month = Utilities.formatDate(dt, 'UTC', 'MM');
+  return { year, month };
+}
+
+function parseOdooUtc_(odooUtcString) {
+  const s = String(odooUtcString || '1970-01-01 00:00:00');
+  const iso = s.replace(' ', 'T') + 'Z';
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? new Date('1970-01-01T00:00:00Z') : d;
+}
+
+/* -------------------- Documents folder helpers (execute_kw) -------------------- */
+
+// NEW: pick a company_id that Documents will accept for folders
+function getDocsCompanyId_(targetCfg) {
+  // Try to read any existing document's company_id
+  const rows = odooExecuteKw_(
+    targetCfg,
+    'documents.document', 'search_read',
+    [[['id', '>', 0]], ['company_id']],
+    { limit: 1 }
+  ) || [];
+
+  if (rows.length && rows[0].company_id) return m2oId_(rows[0].company_id);
+
+  // If no docs exist yet, just return false and let Odoo default it
+  return false;
+}
+
+function getOrCreateRootTaxesFolderId_(targetCfg, companyId) {
+  // Root folder is a documents.document with type='folder' and no parent (folder_id = false)
+  const ids = odooExecuteKw_(
+    targetCfg,
+    'documents.document', 'search',
+    [[
+      ['name', '=', 'Taxes'],
+      ['type', '=', 'folder'],
+      ['folder_id', '=', false]
+    ]],
+    { limit: 1 }
+  );
+
+  if (ids.length) return ids[0];
+
+  const vals = {
+    name: 'Taxes',
+    type: 'folder',
+    folder_id: false
+  };
+  if (companyId) vals.company_id = companyId;
+
+  return odooExecuteKw_(targetCfg, 'documents.document', 'create', [[vals]], {});
+}
+
+
+function ensureDocumentsFolderPath_(targetCfg, companyId, rootFolderId, year, month) {
+  const rootId = m2oId_(rootFolderId);
+  const yearId = findOrCreateFolderDoc_(targetCfg, companyId, String(year), rootId);
+  const monthId = findOrCreateFolderDoc_(targetCfg, companyId, String(month), m2oId_(yearId));
+  return m2oId_(monthId);
+}
+
+function findOrCreateFolderDoc_(targetCfg, companyId, name, parentFolderDocId) {
+  const parentId = m2oId_(parentFolderDocId);
+
+  // IMPORTANT: folders are type='folder' in your DB
+  const ids = odooExecuteKw_(
+    targetCfg,
+    'documents.document', 'search',
+    [[
+      ['name', '=', name],
+      ['type', '=', 'folder'],
+      ['folder_id', '=', parentId]
+    ]],
+    { limit: 1 }
+  );
+  if (ids.length) return ids[0];
+
+  const vals = {
+    name: name,
+    type: 'folder',
+    folder_id: parentId
+  };
+  if (companyId) vals.company_id = companyId;
+
+  return odooExecuteKw_(targetCfg, 'documents.document', 'create', [[vals]], {});
+}
+
+
+// NEW: fail fast with real info if we built a non-folder id
+function assertValidFolderDocId_(targetCfg, folderDocId, ctx) {
+  const id = m2oId_(folderDocId);
+  if (!id) throw new Error('Folder id resolved falsy: ' + JSON.stringify({ folderDocId, ctx }));
+
+  const rows = odooExecuteKw_(
+    targetCfg,
+    'documents.document', 'read',
+    [[id], ['id','name','type','folder_id','company_id']],
+    {}
+  );
+
+  const r = rows && rows[0];
+  if (!r || r.type !== 'folder') {
+    throw new Error('Resolved dest folder is not a folder: ' + JSON.stringify({ got: r, ctx }));
+  }
+}
+
+function RESET_OdooSyncCursor() {
+  const props = PropertiesService.getScriptProperties();
+
+  // main sync cursor
+  props.deleteProperty('ODOO_SYNC_LAST_ATTACHMENT_ID');
+
+  // legacy cursor (safe)
+  props.deleteProperty(CFG.CURSOR_KEY);
+
+  // delete ALL GC cursors (they are dynamic keys)
+  const all = props.getProperties(); // {key: value}
+  let n = 0;
+  for (const k of Object.keys(all)) {
+    if (k.startsWith('ODOO_SYNC_GC_LAST_TARGET_ATT_ID|')) {
+      props.deleteProperty(k);
+      n++;
+    }
+  }
+
+  // optional: clear auth cache if you want fresh logins next run
+  ODOO_UID_CACHE.clear();
+
+  Logger.log(`✅ Reset done. Cleared main cursor + ${n} GC cursor(s).`);
+}
+
+function DEBUG_ListSyncCursors() {
+  const props = PropertiesService.getScriptProperties();
+  const all = props.getProperties();
+
+  Logger.log('--- CURSORS ---');
+  Logger.log('ODOO_SYNC_LAST_ATTACHMENT_ID=' + (all['ODOO_SYNC_LAST_ATTACHMENT_ID'] || '(missing)'));
+  Logger.log(CFG.CURSOR_KEY + '=' + (all[CFG.CURSOR_KEY] || '(missing)'));
+
+  const gc = Object.keys(all).filter(k => k.startsWith('ODOO_SYNC_GC_LAST_TARGET_ATT_ID|'));
+  Logger.log('GC cursor count=' + gc.length);
+  if (gc.length) Logger.log('GC cursor sample=' + JSON.stringify(gc.slice(0, 5), null, 2));
+}
+
+
+
+function DEBUG_SourceAttachmentProbe() {
+  Logger.log('=== SOURCE ATTACHMENT PROBE START ===');
+  Logger.log('baseUrl=' + CFG.SOURCE.baseUrl);
+  Logger.log('db=' + CFG.SOURCE.db);
+  Logger.log('login=' + CFG.SOURCE.login);
+
+  // 1) Can we see any tasks at all?
+  const taskCount = odooExecuteKw_(CFG.SOURCE, 'project.task', 'search_count', [[['id', '>', 0]]], {});
+  Logger.log('project.task count=' + taskCount);
+
+  // 2) Can we see any attachments at all?
+  const attCount = odooExecuteKw_(CFG.SOURCE, 'ir.attachment', 'search_count', [[['id', '>', 0]]], {});
+  Logger.log('ir.attachment count=' + attCount);
+
+  // 3) How many attachments are directly on project.task?
+  const attTaskCount = odooExecuteKw_(CFG.SOURCE, 'ir.attachment', 'search_count', [[['res_model', '=', 'project.task']]], {});
+  Logger.log("ir.attachment where res_model='project.task' count=" + attTaskCount);
+
+  // 4) Break down by type for project.task
+  const attTaskBinary = odooExecuteKw_(CFG.SOURCE, 'ir.attachment', 'search_count',
+    [[['res_model', '=', 'project.task'], ['type', '=', 'binary']]], {});
+  const attTaskUrl = odooExecuteKw_(CFG.SOURCE, 'ir.attachment', 'search_count',
+    [[['res_model', '=', 'project.task'], ['type', '=', 'url']]], {});
+  Logger.log("project.task attachments type=binary count=" + attTaskBinary);
+  Logger.log("project.task attachments type=url count=" + attTaskUrl);
+
+  // 5) Sample 5 attachments from the whole system (to see real shapes)
+  const sample = odooExecuteKw_(
+    CFG.SOURCE,
+    'ir.attachment', 'search_read',
+    [[['id', '>', 0]], ['id','name','res_model','res_id','type','mimetype','create_date']],
+    { limit: 5, order: 'id desc' }
+  ) || [];
+  Logger.log('sample ir.attachment (last 5): ' + JSON.stringify(sample, null, 2));
+
+  // 6) If project.task attachments exist, sample them
+  const taskSample = odooExecuteKw_(
+    CFG.SOURCE,
+    'ir.attachment', 'search_read',
+    [[['res_model', '=', 'project.task']], ['id','name','res_model','res_id','type','mimetype','create_date']],
+    { limit: 5, order: 'id desc' }
+  ) || [];
+  Logger.log("sample res_model='project.task': " + JSON.stringify(taskSample, null, 2));
+
+  // 7) Check if attachments are instead on mail.message (VERY common)
+  const msgAttCount = odooExecuteKw_(
+    CFG.SOURCE,
+    'ir.attachment', 'search_count',
+    [[['res_model', '=', 'mail.message']]],
+    {}
+  );
+  Logger.log("ir.attachment where res_model='mail.message' count=" + msgAttCount);
+
+  const msgSample = odooExecuteKw_(
+    CFG.SOURCE,
+    'ir.attachment', 'search_read',
+    [[['res_model', '=', 'mail.message']], ['id','name','res_model','res_id','type','create_date']],
+    { limit: 5, order: 'id desc' }
+  ) || [];
+  Logger.log("sample res_model='mail.message': " + JSON.stringify(msgSample, null, 2));
+
+  Logger.log('=== SOURCE ATTACHMENT PROBE END ===');
+}
+
+function DEBUG_TargetDocDriveFields(targetCfg, companyId, docId) {
+  const r = odooExecuteKw_(targetCfg, 'documents.document', 'read',
+    [[docId], ['id','name','company_id','owner_id','folder_id','type','is_folder','access_ids','tag_ids']],
+    { context: { allowed_company_ids:[companyId], force_company:companyId } }
+  );
+  Logger.log(JSON.stringify(r, null, 2));
+}
+
+// --- marker helpers ---
+function buildMarkerPrefix_() {
+  return `ODOO_SYNC|SRC_DB=${CFG.SOURCE.db}|SRC_ATT=`;
+}
+function parseSrcAttIdFromMarker_(desc) {
+  const m = String(desc || '').match(/ODOO_SYNC\|SRC_DB=[^|]+\|SRC_ATT=(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+function isQualifyingTaxTaskName_(taskName) {
+  // require BOTH Tax PH and bracket period [YYYY] or [YYYY.MM]
+  return /Tax PH/i.test(taskName || '') && /\[(20\d{2})(\.(0[1-9]|1[0-2]))?\]/.test(taskName || '');
+}
+function targetKey_(targetCfg, companyId) {
+  return [targetCfg.baseUrl, targetCfg.db, targetCfg.login, String(companyId)].join('|');
+}
+
+// --- delete target doc+attachment safely ---
+function deleteTargetDocAndAttachment_(targetCfg, companyId, targetAttachmentId) {
+  const attId = Number(targetAttachmentId);
+  if (!attId) return;
+
+  // 0) If attachment already gone, do nothing (prevents MissingError)
+  const exists = odooExecuteKw_(
+    targetCfg,
+    'ir.attachment', 'search',
+    [[['id', '=', attId]]],
+    { limit: 1 }
+  ) || [];
+
+  if (!exists.length) {
+    Logger.log(`GC: target attachment already missing attId=${attId} (skip)`);
+    return;
+  }
+
+  // 1) delete documents.document rows referencing attachment_id (ok if none)
+  let docIds = [];
+  try {
+    docIds = odooExecuteKw_(
+      targetCfg,
+      'documents.document', 'search',
+      [[['attachment_id', '=', attId]]],
+      { context: { allowed_company_ids: [companyId], force_company: companyId }, limit: 50 }
+    ) || [];
+  } catch (e) {
+    Logger.log(`GC: documents.document.search failed for attId=${attId}: ${e && e.message ? e.message : e}`);
+    docIds = [];
+  }
+
+  if (docIds.length) {
+    try {
+      odooExecuteKw_(
+        targetCfg,
+        'documents.document', 'unlink',
+        [docIds],
+        { context: { allowed_company_ids: [companyId], force_company: companyId } }
+      );
+    } catch (e) {
+      // Don't fail GC if docs are already gone / permissions / etc.
+      Logger.log(`GC: documents.document.unlink failed for attId=${attId} docIds=${JSON.stringify(docIds)}: ${e && e.message ? e.message : e}`);
+    }
+  }
+
+  // 2) delete the attachment itself (safe)
+  try {
+    odooExecuteKw_(targetCfg, 'ir.attachment', 'unlink', [[attId]], {});
+  } catch (e) {
+    // Swallow "already deleted" / MissingError
+    const msg = String(e && e.message ? e.message : e);
+    if (msg.includes('MissingError') || msg.includes('does not exist') || msg.includes('has been deleted')) {
+      Logger.log(`GC: ir.attachment already deleted attId=${attId} (ignore)`);
+      return;
+    }
+    throw e; // real error
+  }
+}
+
+
+function syncDeletionsForTarget_(targetCfg, companyId, allowedSourceProjectIds) {
+  const props = PropertiesService.getScriptProperties();
+
+  const key = targetKey_(targetCfg, companyId);
+  const CURSOR_KEY = 'ODOO_SYNC_GC_LAST_TARGET_ATT_ID|' + key;
+
+  const lastTargetAttId = Number(props.getProperty(CURSOR_KEY) || '0');
+  const markerPrefix = buildMarkerPrefix_();
+
+  // Pull a page of target attachments that were created by the sync (by marker)
+  let rows = odooExecuteKw_(
+  targetCfg,
+  'ir.attachment', 'search_read',
+  [[
+    ['id', '>', lastTargetAttId],
+    ['description', 'ilike', markerPrefix]
+  ], ['id','description']],
+  { limit: 200, order: 'id asc' }
+) || [];
+
+// ✅ wrap-around: if cursor is past the end, reset and scan from 0 (IN THE SAME RUN)
+if (!rows.length && lastTargetAttId > 0) {
+  props.setProperty(CURSOR_KEY, '0');
+  rows = odooExecuteKw_(
+    targetCfg,
+    'ir.attachment', 'search_read',
+    [[
+      ['id', '>', 0],
+      ['description', 'ilike', markerPrefix]
+    ], ['id','description']],
+    { limit: 200, order: 'id asc' }
+  ) || [];
+}
+
+if (!rows.length) return { scanned: 0, deleted: 0 };
+
+Logger.log('GC markerPrefix=' + markerPrefix);
+Logger.log('GC lastTargetAttId=' + lastTargetAttId);
+Logger.log('GC rows=' + rows.length);
+if (rows.length) Logger.log('GC sample=' + JSON.stringify(rows.slice(0,3), null, 2));
+
+
+ 
+
+
+  // Parse source attachment IDs from marker
+  const targetAttIds = [];
+  const srcAttIds = [];
+  const srcByTargetAtt = new Map(); // targetAttId -> srcAttId
+  let maxSeen = lastTargetAttId;
+
+  for (const r of rows) {
+    maxSeen = Math.max(maxSeen, Number(r.id) || 0);
+    const srcId = parseSrcAttIdFromMarker_(r.description);
+    if (!srcId) continue;
+    targetAttIds.push(r.id);
+    srcAttIds.push(srcId);
+    srcByTargetAtt.set(r.id, srcId);
+  }
+
+  // Read source attachments for those srcAttIds (bulk)
+  // If attachment is deleted OR moved off project.task OR type changed, it will not match this search_read
+  const srcAttRows = odooExecuteKw_(
+    CFG.SOURCE,
+    'ir.attachment', 'search_read',
+    [[
+      ['id', 'in', srcAttIds],
+      ['res_model', '=', 'project.task'],
+      ['type', '=', 'binary']
+    ], ['id','res_id']],
+    { limit: srcAttIds.length }
+  ) || [];
+
+ // If we reached the end, wrap around so old synced items are rechecked for deletions
+if (!rows.length && lastTargetAttId > 0) {
+  props.setProperty(CURSOR_KEY, '0');
+  return { scanned: 0, deleted: 0 };
+}
+  const srcExists = new Map(); // srcAttId -> res_id(task_id)
+  for (const s of srcAttRows) srcExists.set(Number(s.id), Number(s.res_id));
+
+  // Read tasks for still-existing attachments
+  const taskIds = [...new Set([...srcExists.values()].filter(Boolean))];
+  const tasks = taskIds.length
+  ? (odooExecuteKw_(
+      CFG.SOURCE,
+      'project.task',
+      'read',
+      [taskIds, ['id','project_id','name','stage_id']],
+      {}
+    ) || [])
+  : [];
+
+
+const ALLOWED_STAGE_NAME = 'APPROVED / DONE';
+
+
+const taskInfo = new Map(); // taskId -> {projectId, name, stageNameUp}
+for (const t of tasks) {
+  const pid = Array.isArray(t.project_id) ? t.project_id[0] : t.project_id;
+
+  const st = t.stage_id;
+  const stName = Array.isArray(st) ? String(st[1] || '') : '';
+  const stageNameUp = String(stName || '').trim().toUpperCase();
+
+  taskInfo.set(Number(t.id), {
+    projectId: Number(pid) || 0,
+    name: String(t.name || ''),
+    stageNameUp
+  });
+}
+
+
+  // Decide deletes
+  let deleted = 0;
+
+  for (const targetAttId of targetAttIds) {
+    const srcAttId = srcByTargetAtt.get(targetAttId);
+    const taskId = srcExists.get(srcAttId);
+
+    // Condition A: source attachment gone OR not on project.task anymore => delete in target
+    if (!taskId) {
+      deleteTargetDocAndAttachment_(targetCfg, companyId, targetAttId);
+      deleted++;
+      continue;
+    }
+
+    const info = taskInfo.get(taskId);
+
+    // If task missing (shouldn't, but safe) => delete
+    if (!info) {
+      deleteTargetDocAndAttachment_(targetCfg, companyId, targetAttId);
+      deleted++;
+      continue;
+    }
+
+    // Condition B: moved to a different project that does NOT route to this target => delete here
+    if (allowedSourceProjectIds && allowedSourceProjectIds.length) {
+      if (!allowedSourceProjectIds.includes(info.projectId)) {
+        deleteTargetDocAndAttachment_(targetCfg, companyId, targetAttId);
+        deleted++;
+        continue;
+      }
+    }
+
+    // Condition C: no longer matches Tax PH + bracket OR no longer in Approved/Done => delete
+if (!isQualifyingTaxTaskName_(info.name) || info.stageNameUp !== ALLOWED_STAGE_NAME) {
+  deleteTargetDocAndAttachment_(targetCfg, companyId, targetAttId);
+  deleted++;
+  continue;
+}
+
+  }
+
+  props.setProperty(CURSOR_KEY, String(maxSeen));
+  return { scanned: rows.length, deleted };
+}
+
+/**
+ * Fill ProjectRouting!Company based on ProjectRouting!source_project_id
+ * - Reads project.project(name) from CFG.SOURCE
+ * - Writes name into the "Company" header column
+ * - Safe if you insert columns: it finds columns by header text
+ */
+function autofillCompanyFromProjectId_ProjectRouting() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(CFG.ROUTING_SHEET_NAME);
+  if (!sh) throw new Error(`Missing sheet: ${CFG.ROUTING_SHEET_NAME}`);
+
+  const range = sh.getDataRange();
+  const values = range.getValues();
+  if (values.length < 2) return;
+
+  const headers = values[0].map(h => String(h).trim());
+  const idxProject = headers.indexOf('source_project_id');
+  const idxCompany = headers.indexOf('Company');
+
+  if (idxProject < 0) throw new Error(`ProjectRouting missing header: source_project_id`);
+  if (idxCompany < 0) throw new Error(`ProjectRouting missing header: Company`);
+
+  // Collect unique project ids needing lookup
+  const need = new Map(); // pid -> [rowIndex,...]
+  for (let r = 1; r < values.length; r++) {
+    const pid = Number(values[r][idxProject]);
+    const cur = String(values[r][idxCompany] || '').trim();
+    if (!pid) continue;
+    if (cur) continue; // don't overwrite existing values
+    if (!need.has(pid)) need.set(pid, []);
+    need.get(pid).push(r);
+  }
+
+  if (!need.size) {
+    Logger.log('Company autofill: nothing to fill.');
+    return;
+  }
+
+  // Bulk read project names from Odoo
+  const pids = [...need.keys()];
+  const rows = odooExecuteKw_(
+    CFG.SOURCE,
+    'project.project',
+    'read',
+    [pids, ['id', 'name']],
+    {}
+  ) || [];
+
+  const nameById = new Map(rows.map(r => [Number(r.id), String(r.name || '')]));
+
+  // Write back
+  for (const [pid, rowIdxs] of need.entries()) {
+    const pname = nameById.get(pid) || '';
+    for (const r of rowIdxs) {
+      values[r][idxCompany] = pname;
+    }
+  }
+
+  range.setValues(values);
+  Logger.log(`Company autofill: filled ${need.size} project(s).`);
+}
+
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+
+    const sh = e.range.getSheet();
+    if (!sh || sh.getName() !== CFG.ROUTING_SHEET_NAME) return;
+
+    // Don’t run on header edits
+    if (e.range.getRow() === 1) return;
+
+    syncCompanyColumnForEditedRange_(sh, e.range);
+  } catch (err) {
+    Logger.log('onEdit error: ' + (err && err.message ? err.message : err));
+  }
+}
+
+/**
+ * Handles:
+ * - Single edit
+ * - Bulk paste (multi-row)
+ * - Bulk delete (multi-row)
+ *
+ * Rules:
+ * - If source_project_id cell is blank => clear Company cell (same row)
+ * - If source_project_id has ID => fetch project name and set Company
+ * - Only applies to rows affected by the edit range (fast)
+ */
+function syncCompanyColumnForEditedRange_(sh, editedRange) {
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
+
+  const idxProject = headers.indexOf('source_project_id');
+  const idxCompany = headers.indexOf('Company');
+
+  if (idxProject < 0) throw new Error(`ProjectRouting missing header: source_project_id`);
+  if (idxCompany < 0) throw new Error(`ProjectRouting missing header: Company`);
+
+  const projectCol = idxProject + 1;
+  const companyCol = idxCompany + 1;
+
+  // If the edited range does NOT intersect the source_project_id column, ignore
+  const editLeft = editedRange.getColumn();
+  const editRight = editLeft + editedRange.getNumColumns() - 1;
+  if (projectCol < editLeft || projectCol > editRight) return;
+
+  // Determine affected rows
+  const startRow = editedRange.getRow();
+  const numRows = editedRange.getNumRows();
+
+  // Read only the project ids for affected rows
+  const projectVals = sh.getRange(startRow, projectCol, numRows, 1).getValues(); // [[val],[val],...]
+
+  // Build list of row indices that need clearing, and unique IDs that need lookup
+  const rowsToClear = [];              // sheet row numbers
+  const needLookup = new Map();        // pid -> [sheetRowNumber,...]
+
+  for (let i = 0; i < numRows; i++) {
+    const sheetRow = startRow + i;
+    const raw = projectVals[i][0];
+
+    const pid = Number(raw);
+    const hasPid = Number.isFinite(pid) && pid > 0;
+
+    if (!hasPid) {
+      // blank / non-numeric / deleted => clear Company
+      rowsToClear.push(sheetRow);
+      continue;
+    }
+
+    if (!needLookup.has(pid)) needLookup.set(pid, []);
+    needLookup.get(pid).push(sheetRow);
+  }
+
+  // 1) Clear Company for deleted/blank project IDs (bulk)
+  if (rowsToClear.length) {
+    // Build a 2D values array to set blanks in one go (contiguous block)
+    // If rows are non-contiguous, do chunking by runs.
+    const runs = buildContiguousRuns_(rowsToClear);
+    for (const run of runs) {
+      sh.getRange(run.start, companyCol, run.len, 1).setValues(Array(run.len).fill(['']));
+    }
+  }
+
+  // 2) Lookup project names for valid IDs and write Company (bulk)
+  if (needLookup.size) {
+    const pids = [...needLookup.keys()];
+
+    // Bulk read from Odoo
+    const rows = odooExecuteKw_(
+      CFG.SOURCE,
+      'project.project',
+      'read',
+      [pids, ['id', 'name']],
+      {}
+    ) || [];
+
+    const nameById = new Map(rows.map(r => [Number(r.id), String(r.name || '')]));
+
+    // Write values row-by-row but batched by contiguous runs (fast)
+    const toWrite = []; // [{row, val}]
+    for (const [pid, sheetRows] of needLookup.entries()) {
+      const name = nameById.get(pid) || ''; // if unknown id, write blank
+      for (const r of sheetRows) toWrite.push({ row: r, val: name });
+    }
+
+    // Sort and write in contiguous blocks
+    toWrite.sort((a, b) => a.row - b.row);
+
+    let i = 0;
+    while (i < toWrite.length) {
+      const start = toWrite[i].row;
+      let end = start;
+      const vals = [[toWrite[i].val]];
+      i++;
+
+      while (i < toWrite.length && toWrite[i].row === end + 1) {
+        end++;
+        vals.push([toWrite[i].val]);
+        i++;
+      }
+
+      sh.getRange(start, companyCol, vals.length, 1).setValues(vals);
+    }
+  }
+}
+
+/** helper: turn [2,3,4,10,11] -> [{start:2,len:3},{start:10,len:2}] */
+function buildContiguousRuns_(rows) {
+  const sorted = [...rows].sort((a, b) => a - b);
+  const runs = [];
+  let i = 0;
+
+  while (i < sorted.length) {
+    const start = sorted[i];
+    let end = start;
+    i++;
+    while (i < sorted.length && sorted[i] === end + 1) {
+      end = sorted[i];
+      i++;
+    }
+    runs.push({ start, len: end - start + 1 });
+  }
+  return runs;
+}
+
+function installOnEditTrigger_ProjectRouting() {
+  const ss = SpreadsheetApp.getActive();
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === 'onEdit') ScriptApp.deleteTrigger(t);
+  }
+  ScriptApp.newTrigger('onEdit').forSpreadsheet(ss).onEdit().create();
+}
+
+function isFalsyOdooValue_(v) {
+  if (v === null || v === undefined || v === false) return true;
+  const s = String(v).trim().toLowerCase();
+  return s === '' || s === 'false' || s === '0' || s === 'null' || s === 'none' || s === 'undefined';
+}
