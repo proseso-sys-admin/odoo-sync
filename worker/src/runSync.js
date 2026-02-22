@@ -1,6 +1,7 @@
 /**
  * Orchestrator: load routes, run Tax PH and Onboarding in parallel.
  * Each flow processes target DBs in parallel (with cap).
+ * Optional opts.targetKey or opts.targetKeys limits sync to those targets only.
  */
 
 import { getSourceConfig } from './config.js';
@@ -8,12 +9,32 @@ import { loadRoutesFromOdoo } from './routes.js';
 import { runTaxSync } from './taxSync.js';
 import { runOnboardingSync } from './onboardingSync.js';
 import { MAX_CONCURRENT_TARGETS } from './config.js';
+import { routeKey } from './odoo.js';
 
-export async function runFullSync() {
+/**
+ * @param {object} [opts]
+ * @param {string} [opts.targetKey] - If set, run sync only for this target (key = baseUrl|db|login|companyId).
+ * @param {string[]} [opts.targetKeys] - If set, run sync only for these targets. Ignored if targetKey is set.
+ * @returns {Promise<object>}
+ */
+export async function runFullSync(opts = {}) {
   const sourceCfg = getSourceConfig();
-  const routing = await loadRoutesFromOdoo(sourceCfg);
+  let routing = await loadRoutesFromOdoo(sourceCfg);
+
+  if (opts.targetKey || (opts.targetKeys && opts.targetKeys.length > 0)) {
+    const allowed = opts.targetKey
+      ? new Set([opts.targetKey])
+      : new Set(opts.targetKeys);
+    const filtered = new Map();
+    for (const [spid, route] of routing) {
+      if (allowed.has(routeKey(route))) filtered.set(spid, route);
+    }
+    routing = filtered;
+  }
+
   if (!routing.size) {
-    return { ok: true, routes: 0, tax: null, onboarding: null };
+    const targetFilter = opts.targetKey || opts.targetKeys ? 'no_matching_route' : undefined;
+    return { ok: true, routes: 0, tax: null, onboarding: null, target_filter: targetFilter };
   }
 
   const maxConcurrent = MAX_CONCURRENT_TARGETS;

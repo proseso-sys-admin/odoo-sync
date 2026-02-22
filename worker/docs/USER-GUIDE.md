@@ -170,7 +170,7 @@ gcloud scheduler jobs run odoo-sync-every-5min --location=asia-southeast1
 
 **Deploying the worker** means: building your code into a container image, uploading it to Google, and creating or updating a **Cloud Run service** so that when someone (or the scheduler) calls the service URL, Google runs your sync code.
 
-**Deploying the scheduler** means: creating a **Cloud Scheduler job** that, on a schedule, sends an HTTP request to your Cloud Run URL (e.g. `https://your-service.run.app/sync`). No extra container; it’s just a timer that hits your already-deployed worker.
+**Deploying the scheduler** means: creating a **Cloud Scheduler job** that, on a schedule, sends an HTTP request to your Cloud Run URL (e.g. `https://odoo-sync-worker-njiacix2yq-as.a.run.app/sync`). No extra container; it’s just a timer that hits your already-deployed worker.
 
 **Full redeploy (worker) — when source credentials are in Secret Manager:**
 
@@ -200,7 +200,7 @@ gcloud run services update odoo-sync-worker --region=asia-southeast1 --set-env-v
 
 ```powershell
 $REGION = "asia-southeast1"
-$SERVICE_URL = "https://odoo-sync-worker-xxxxx-as.a.run.app"   # use your real URL
+$SERVICE_URL = "https://odoo-sync-worker-njiacix2yq-as.a.run.app"
 $JOB_NAME = "odoo-sync-every-5min"
 
 gcloud scheduler jobs create http $JOB_NAME `
@@ -255,7 +255,7 @@ A reasonable total is **about $5–20 per month**, with **$10–15** as a typica
 | “Cannot update environment variable [X] to string literal because it has already been set with a different type” | That variable is set as a **secret**. Keep using `--set-secrets` for it; don’t switch it to `--set-env-vars` in the same deploy. |
 | Scheduler creation fails with “Duration must end with time part character” | Use `--attempt-deadline=600s` (with **s**), not `600`. |
 | Same file in all tax fields but only one copy in target | The worker syncs one attachment once. If Odoo stored one attachment for all fields, you get one copy. Upload separately to each field if you need one copy per category. |
-| I want to run sync by hand in the cloud | Use the Cloud Run URL: `Invoke-WebRequest -Uri "https://your-service.run.app/sync" -Method GET -UseBasicParsing`, or run the scheduler job once (section 9). |
+| I want to run sync by hand in the cloud | Use the Cloud Run URL: `Invoke-WebRequest -Uri "https://odoo-sync-worker-njiacix2yq-as.a.run.app/sync" -Method GET -UseBasicParsing`, or run the scheduler job once (section 9). |
 
 ---
 
@@ -270,7 +270,7 @@ gcloud run services describe odoo-sync-worker --region=asia-southeast1 --format=
 **Trigger sync once (cloud)**
 
 ```powershell
-Invoke-WebRequest -Uri "https://YOUR_SERVICE_URL/sync" -Method GET -UseBasicParsing
+Invoke-WebRequest -Uri "https://odoo-sync-worker-njiacix2yq-as.a.run.app/sync" -Method GET -UseBasicParsing
 ```
 
 **One-time cursor reset (cloud)** — then trigger sync once, then remove the variable
@@ -295,6 +295,264 @@ gcloud scheduler jobs list --location=asia-southeast1
 ```powershell
 gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="odoo-sync-worker"' --limit=50 --format="table(timestamp,severity,textPayload)" --freshness=1d
 ```
+
+---
+
+## 12. Detailed step-by-step: Odoo automation to trigger the worker (webhook or full sync)
+
+Follow these steps in your **source** Odoo database. You can either trigger **full sync** (all targets) or **single-target sync** (only the target for the attachment’s project).
+
+### Before you start
+
+- Worker URL for this project: `https://odoo-sync-worker-njiacix2yq-as.a.run.app` (or run `gcloud run services describe odoo-sync-worker --region=asia-southeast1 --format="value(status.url)"` to get it).
+- (Optional) If you use a webhook secret, know the value you set as `WEBHOOK_SECRET` on the worker.
+
+---
+
+### Step 1: Open Automation
+
+1. Log in to the **source** Odoo (where tasks and attachments live).
+2. Go to **Settings** (gear icon).
+3. At the bottom, under **Technical**, click **Automation** → **Automated Actions**.
+   - If you don’t see **Technical**, enable **Developer Mode**: Settings → **Activate the developer mode**.
+4. Click **Create**.
+
+---
+
+### Step 2: Basic settings
+
+1. **Action Name**  
+   Example: `Notify Odoo Sync Worker on attachment change`.
+
+2. **Model**  
+   Open the dropdown and choose **Attachment** (technical name: `ir.attachment`).  
+   This makes the automation run when attachments are created, updated, or deleted.
+
+3. **When to Run (Trigger)**  
+   Choose when the worker should be called. Options depend on your Odoo version:
+   - **Odoo 17 / 19:** Trigger is often a single dropdown, e.g. **"On create and edit"** (covers new uploads and changes). If you also need runs when an attachment is **deleted**, check if there is an option like "On create, update and delete" or create a **second** automation rule with trigger "On delete" and the same Actions.
+   - **Odoo (older):** You may be able to tick multiple (On Create, On Update, On Delete). If so, tick the ones you need.
+   - **Minimum:** Use at least **"On create and edit"** so uploads and changes trigger the worker.
+
+4. **Apply on**  
+   Leave **Record set** (default).
+
+5. **Domain Filter (optional but recommended)**  
+   So only **task** attachments trigger the automation, set:
+   ```text
+   [('res_model', '=', 'project.task')]
+   ```  
+   Leave empty if you want any attachment (any model) to trigger.
+
+---
+
+### Step 3: Action type and code
+
+1. **Action To Do**  
+   Select **Execute Python Code**.
+
+2. In the **Python Code** box, paste **one** of the two options below.
+
+---
+
+### Option A: Full sync (all targets) on any attachment change
+
+Use this if you want: “whenever an attachment changes, run sync for **all** target databases.”
+
+- **Worker URL:** `https://odoo-sync-worker-njiacix2yq-as.a.run.app/webhook`
+- **Body:** empty `{}`. The worker then runs full sync.
+- **Secret (optional):** If you set `WEBHOOK_SECRET` on the worker, add the header below and use the same value.
+
+**Python code for Option A:**
+
+```python
+import json
+import urllib.request
+
+worker_url = "https://odoo-sync-worker-njiacix2yq-as.a.run.app/webhook"
+payload = {}
+headers = {"Content-Type": "application/json"}
+# If you set WEBHOOK_SECRET on the worker, uncomment and set the same value:
+# headers["X-Webhook-Secret"] = "your-secret-here"
+
+req = urllib.request.Request(worker_url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+try:
+    urllib.request.urlopen(req, timeout=60)
+except Exception as e:
+    import logging
+    logging.getLogger(__name__).warning("Odoo sync webhook failed: %s", e)
+```
+
+---
+
+### Option B: Single-target sync (only the target for this attachment’s project)
+
+Use this if you want: “when an attachment changes, run sync **only** for the target database linked to that attachment’s project” (via the project’s General task Sync tab).
+
+- **Worker URL:** same as above, `.../webhook`.
+- **Body:** the worker expects either `target_key` or the four fields below. This code reads the **General** task for the attachment’s project and sends those four fields so only that target is synced.
+- **Secret (optional):** same as Option A.
+
+**Python code for Option B:**
+
+```python
+import json
+import urllib.request
+
+# Only for task attachments; otherwise do nothing
+if record.res_model == 'project.task' and record.res_id:
+  task = env['project.task'].browse(record.res_id)
+  if task and task.project_id:
+    project_id = task.project_id.id
+    general = env['project.task'].search([
+        ('project_id', '=', project_id),
+        ('name', '=', 'General')
+    ], limit=1)
+    if general and general.x_studio_enabled and str(general.x_studio_enabled).lower() == 'true':
+      raw_acct = general.x_studio_accounting_database
+      target_base_url = ''
+      target_db = ''
+      if raw_acct:
+        s = str(raw_acct).strip()
+        if s.startswith('{') and s.endswith('}'):
+          try:
+            o = json.loads(s)
+            target_base_url = (o.get('baseUrl') or o.get('target_base_url') or '').strip()
+            target_db = (o.get('db') or o.get('target_db') or '').strip()
+            if target_base_url and not target_db:
+              target_db = target_base_url.split('/')[-1].split('.')[0] or target_base_url.replace('https://', '').replace('http://', '').split('.')[0]
+          except Exception:
+            pass
+        if not target_base_url and s.startswith('http'):
+          target_base_url = s.rstrip('/')
+          target_db = s.replace('https://', '').replace('http://', '').split('.')[0].split('/')[0]
+      target_login = (general.x_studio_email or '').strip()
+      if target_base_url and target_db and target_login:
+        multi = general.x_studio_multi_company and str(general.x_studio_multi_company).lower() == 'true'
+        target_company_id = int(general.x_studio_company_id_if_multi_company or 1) if multi else 1
+        worker_url = "https://odoo-sync-worker-njiacix2yq-as.a.run.app/webhook"
+        payload = {
+            "target_base_url": target_base_url,
+            "target_db": target_db,
+            "target_login": target_login,
+            "target_company_id": target_company_id,
+        }
+        headers = {"Content-Type": "application/json"}
+        # If you set WEBHOOK_SECRET on the worker, uncomment and set the same value:
+        # headers["X-Webhook-Secret"] = "your-secret-here"
+        req = urllib.request.Request(worker_url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=60)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Odoo sync webhook failed: %s", e)
+```
+
+---
+
+### Step 4: Replace placeholders and save
+
+1. In the code you chose (A or B), replace:
+   - The worker URL is already set in the code above (`https://odoo-sync-worker-njiacix2yq-as.a.run.app`). If you use a different project/region, run `gcloud run services describe odoo-sync-worker --region=asia-southeast1 --format="value(status.url)"` and replace it.
+2. If you use a webhook secret:
+   - Uncomment the two lines that set `X-Webhook-Secret` and set `"your-secret-here"` to the same value as `WEBHOOK_SECRET` on the worker.
+3. Click **Save**.
+
+---
+
+### Step 5: Test
+
+1. **Option A:** Upload or delete any attachment (or one on a task if you used the domain filter). Check worker logs or the target DBs to see that a full sync ran.
+2. **Option B:** Upload or delete an attachment on a **task** in a project that has a **General** task with sync enabled and target configured. Check that only that project’s target database was synced (worker logs or target DB).
+
+---
+
+### Summary
+
+| What you want                         | Use    | Result                                      |
+|--------------------------------------|--------|---------------------------------------------|
+| Any attachment change → sync all DBs | Option A | One automation, empty body → full sync.     |
+| Attachment change → sync that project’s target only | Option B | One automation, body with target → single-target sync. |
+
+The **scheduler** (e.g. every 5 minutes) is independent: it still calls `/sync` with no params and runs full sync. The automation only adds extra triggers (webhook) when attachments change.
+
+---
+
+## 13. One automation in Odoo: sync only the target for the changed attachment
+
+You can use **one** automated action on the **source** Odoo so that when an attachment is created, updated, or deleted, the worker runs sync **only for the target** linked to that attachment’s project (not for all targets).
+
+**How it works:** Attachment → task → project → **General** task for that project → read target (URL, db, login, company) from the General task’s Sync tab → POST that single target to the worker’s `/webhook`. The worker then runs sync only for that target.
+
+**Steps in Odoo**
+
+1. **Settings → Technical → Automation → Automated Actions → Create**
+2. **Model:** `Attachment (ir.attachment)`
+3. **Trigger:** e.g. “On Create”, “On Update”, “On Delete” (as needed)
+4. **Apply on:** Record set
+5. **Domain (optional):** `[('res_model', '=', 'project.task')]` so only task attachments trigger
+6. **Action To Do:** Execute Python Code
+
+**Python code** (replace `WORKER_URL` and optionally `WEBHOOK_SECRET`):
+
+```python
+import json
+import urllib.request
+
+# Only for task attachments; otherwise do nothing
+if record.res_model == 'project.task' and record.res_id:
+  task = env['project.task'].browse(record.res_id)
+  if task and task.project_id:
+    project_id = task.project_id.id
+    general = env['project.task'].search([
+        ('project_id', '=', project_id),
+        ('name', '=', 'General')
+    ], limit=1)
+    if general and general.x_studio_enabled and str(general.x_studio_enabled).lower() == 'true':
+      # Target from General task (same fields the worker uses)
+      raw_acct = general.x_studio_accounting_database
+      target_base_url = ''
+      target_db = ''
+      if raw_acct:
+        s = str(raw_acct).strip()
+        if s.startswith('{') and s.endswith('}'):
+          try:
+            o = json.loads(s)
+            target_base_url = (o.get('baseUrl') or o.get('target_base_url') or '').strip()
+            target_db = (o.get('db') or o.get('target_db') or '').strip()
+            if target_base_url and not target_db:
+              target_db = target_base_url.split('/')[-1].split('.')[0] or target_base_url.replace('https://', '').replace('http://', '').split('.')[0]
+          except Exception:
+            pass
+        if not target_base_url and s.startswith('http'):
+          target_base_url = s.rstrip('/')
+          target_db = s.replace('https://', '').replace('http://', '').split('.')[0].split('/')[0]
+      target_login = (general.x_studio_email or '').strip()
+      if target_base_url and target_db and target_login:
+        multi = general.x_studio_multi_company and str(general.x_studio_multi_company).lower() == 'true'
+        target_company_id = int(general.x_studio_company_id_if_multi_company or 1) if multi else 1
+        worker_url = "https://odoo-sync-worker-njiacix2yq-as.a.run.app/webhook"
+        payload = {
+            "target_base_url": target_base_url,
+            "target_db": target_db,
+            "target_login": target_login,
+            "target_company_id": target_company_id,
+        }
+        headers = {"Content-Type": "application/json"}
+        # If you set WEBHOOK_SECRET on the worker, set the same value here (e.g. in a config or env)
+        # secret = env['ir.config_parameter'].sudo().get_param('odoo_sync.webhook_secret') or ''
+        # if secret:
+        #     headers["X-Webhook-Secret"] = secret
+        req = urllib.request.Request(worker_url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=30)
+        except Exception as e:
+            import logging
+            _logger = logging.getLogger(__name__)
+            _logger.warning("Odoo sync webhook call failed: %s", e)
+```
+
+Result: **one** automation; each attachment change triggers the worker **once** with the **one** target for that attachment’s project, so only that database is synced.
 
 ---
 

@@ -103,7 +103,68 @@ gcloud secrets add-iam-policy-binding SOURCE_PASSWORD `
 
 ## 6. Build and deploy to Cloud Run
 
-**Option A: Deploy from source (Cloud Build)**
+**Option C: Deploy from GitHub (recommended)**
+
+Deploying from GitHub is often **better**: no need for Docker or gcloud on your machine, same build every time in the cloud, and you can auto-deploy on push or trigger manually from the GCP Console.
+
+1. **First-time setup** (once per project):
+   - Do a **one-time deploy** with Option A or B below so the Cloud Run service exists and has env vars/secrets set.
+   - **Connect the repo**: [Cloud Build → Repositories](https://console.cloud.google.com/cloud-build/repositories) → **1st gen** tab → **Connect repository** → GitHub → install/authorize the Cloud Build app → select **josephnrqzproseso** / **odoo-sync** → Connect.
+   - **Create the trigger** (Console is most reliable; `gcloud` often returns INVALID_ARGUMENT for GitHub triggers):
+     - [Cloud Build → Triggers](https://console.cloud.google.com/cloud-build/triggers) → **Create trigger**.
+     - Name: `odoo-sync-deploy`. Region: **asia-southeast1** (or your chosen region).
+     - Event: **Push to a branch**. Branch: `^master$`.
+     - Source: **1st gen** → Repository: select **odoo-sync** (must be connected above).
+     - Configuration: **Cloud Build configuration file (yaml or json)** → path: `worker/cloudbuild.yaml`.
+     - Substitution variables (optional): `_SERVICE_NAME` = `odoo-sync-worker`, `_REGION` = `asia-southeast1`.
+     - Create.
+   - Ensure the Artifact Registry repo exists (Option B step) and the Cloud Build service account can push images and deploy to Cloud Run.
+
+2. **Each deploy**: push to `master`, or in Triggers click **Run** on `odoo-sync-deploy`. Env and secrets on the Cloud Run service are unchanged.
+
+**Create trigger via gcloud (2nd gen — use these commands):**
+
+First, create a GitHub connection and link the repo (one-time). Replace `YOUR_PROJECT_ID` with your GCP project ID (e.g. `odoo-ocr-487104`).
+
+If `gcloud builds connections create github` fails with **Secret Manager permission denied**, enable the API and grant the Cloud Build service agent access:
+
+```powershell
+gcloud services enable secretmanager.googleapis.com --project=YOUR_PROJECT_ID
+$PN = (gcloud projects describe YOUR_PROJECT_ID --format="value(projectNumber)")
+$SA = "service-$PN@gcp-sa-cloudbuild.iam.gserviceaccount.com"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID `
+  --member="serviceAccount:$SA" `
+  --role="roles/secretmanager.admin"
+```
+
+```powershell
+$REGION = "asia-southeast1"
+$CONNECTION = "github-conn"
+$PROJECT_ID = "YOUR_PROJECT_ID"   # e.g. odoo-ocr-487104
+
+# 1) Create connection (opens browser to authorize GitHub)
+gcloud builds connections create github $CONNECTION --region=$REGION
+
+# 2) Link the repo to the connection
+gcloud builds repositories create odoo-sync `
+  --remote-uri="https://github.com/josephnrqzproseso/odoo-sync.git" `
+  --connection=$CONNECTION `
+  --region=$REGION
+
+# 3) Create the trigger (use the full repository path).
+# If this returns INVALID_ARGUMENT, create the trigger in the Console (see Option C above) or try without --substitutions.
+gcloud builds triggers create github `
+  --name="odoo-sync-deploy" `
+  --repository="projects/$PROJECT_ID/locations/$REGION/connections/$CONNECTION/repositories/odoo-sync" `
+  --branch-pattern="^master$" `
+  --build-config="worker/cloudbuild.yaml" `
+  --region=$REGION `
+  --substitutions="_SERVICE_NAME=odoo-sync-worker,_REGION=asia-southeast1"
+```
+
+If the connection or repo already exists (e.g. you created them in the Console), run only step 3 with your actual `PROJECT_ID`, `REGION`, and `CONNECTION` name. To see linked repos: `gcloud builds repositories list --connection=CONNECTION_NAME --region=REGION`.
+
+**Option A: Deploy from local source (Cloud Build)**
 
 ```powershell
 cd "C:\Users\josep\OneDrive\Desktop\Odoo Sync\worker"

@@ -158,6 +158,15 @@ export function targetKey(targetCfg, companyId) {
   return [targetCfg.baseUrl, targetCfg.db, targetCfg.login, String(companyId)].join('|');
 }
 
+/** Build target key from a route object (target_base_url, target_db, target_login, target_company_id). */
+export function routeKey(route) {
+  if (!route) return '';
+  return targetKey(
+    { baseUrl: route.target_base_url || '', db: route.target_db || '', login: route.target_login || '' },
+    route.target_company_id ?? 1
+  );
+}
+
 /** Idempotency marker for synced attachments */
 export function buildMarker(sourceDb, sourceAttId) {
   return `ODOO_SYNC|SRC_DB=${sourceDb}|SRC_ATT=${sourceAttId}`;
