@@ -211,9 +211,10 @@ export function isQualifyingGvtContribsTaskName(taskName) {
   return /Gvt contribs Filing/i.test(taskName || '') && /\[(20\d{2})(\.(0[1-9]|1[0-2]))?\]/.test(taskName || '');
 }
 
-/** Build target key for GC cursor */
+/** Build target key for GC cursor. Normalizes baseUrl so webhook payload matches route key. */
 export function targetKey(targetCfg, companyId) {
-  return [targetCfg.baseUrl, targetCfg.db, targetCfg.login, String(companyId)].join('|');
+  const baseUrl = normalizeOdooBaseUrl(targetCfg.baseUrl) || String(targetCfg.baseUrl || '').trim();
+  return [baseUrl, targetCfg.db, targetCfg.login, String(companyId)].join('|');
 }
 
 /** Build target key from a route object (target_base_url, target_db, target_login, target_company_id). */

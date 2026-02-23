@@ -6,7 +6,7 @@
 
 import { getSourceConfig } from './config.js';
 import { loadRoutesFromOdoo } from './routes.js';
-import { runTaxSync } from './taxSync.js';
+import { runTaxSync, syncSingleAttachment, deleteSingleAttachment } from './taxSync.js';
 import { runOnboardingSync } from './onboardingSync.js';
 import { MAX_CONCURRENT_TARGETS } from './config.js';
 import { routeKey } from './odoo.js';
@@ -57,4 +57,28 @@ export async function runFullSync(opts = {}) {
       gcDeleted: onboardingResult.gcDeleted,
     },
   };
+}
+
+/**
+ * Sync a single attachment immediately (bypass cursor).
+ * @param {number|string} attachmentId - Source attachment ID
+ * @returns {Promise<object>}
+ */
+export async function runSingleAttachmentSync(attachmentId) {
+  const sourceCfg = getSourceConfig();
+  const routing = await loadRoutesFromOdoo(sourceCfg);
+  if (!routing.size) return { ok: false, error: 'no_routes' };
+  return syncSingleAttachment(sourceCfg, routing, attachmentId);
+}
+
+/**
+ * Delete a single synced attachment from all targets (bypass cursor).
+ * @param {number|string} attachmentId - Source attachment ID that was deleted
+ * @returns {Promise<object>}
+ */
+export async function runDeleteAttachmentSync(attachmentId) {
+  const sourceCfg = getSourceConfig();
+  const routing = await loadRoutesFromOdoo(sourceCfg);
+  if (!routing.size) return { ok: false, error: 'no_routes' };
+  return deleteSingleAttachment(sourceCfg, routing, attachmentId);
 }

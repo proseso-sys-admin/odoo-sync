@@ -53,7 +53,10 @@ export const FIELD_TO_TAX_BUCKET = {
 
 export function getTaxBucketFromResField(resField) {
   const f = String(resField || '').trim();
-  return FIELD_TO_TAX_BUCKET[f] || null;
+  if (FIELD_TO_TAX_BUCKET[f]) return FIELD_TO_TAX_BUCKET[f];
+  const lower = f.toLowerCase();
+  const key = Object.keys(FIELD_TO_TAX_BUCKET).find((k) => k.toLowerCase() === lower);
+  return key ? FIELD_TO_TAX_BUCKET[key] : null;
 }
 
 export const TAX_BUCKET_FIELDS = Object.keys(FIELD_TO_TAX_BUCKET);
@@ -71,7 +74,10 @@ export const GVT_CONTRIB_BUCKET_FIELDS = Object.keys(FIELD_TO_GVT_CONTRIB_BUCKET
 
 export function getGvtContribBucketFromResField(resField) {
   const f = String(resField || '').trim();
-  return FIELD_TO_GVT_CONTRIB_BUCKET[f] || null;
+  if (FIELD_TO_GVT_CONTRIB_BUCKET[f]) return FIELD_TO_GVT_CONTRIB_BUCKET[f];
+  const lower = f.toLowerCase();
+  const key = Object.keys(FIELD_TO_GVT_CONTRIB_BUCKET).find((k) => k.toLowerCase() === lower);
+  return key ? FIELD_TO_GVT_CONTRIB_BUCKET[key] : null;
 }
 
 export async function ensureBucketTaxPathFolder(targetCfg, companyId, bucketName, yearOrNull, monthNameOrNull) {

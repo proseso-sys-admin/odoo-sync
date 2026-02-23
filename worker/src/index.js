@@ -6,7 +6,7 @@
  */
 
 import http from 'http';
-import { runFullSync } from './runSync.js';
+import { runFullSync, runSingleAttachmentSync, runDeleteAttachmentSync } from './runSync.js';
 import { targetKey } from './odoo.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -51,7 +51,7 @@ async function handleSync(req, res) {
   }
 }
 
-/** Read JSON body from request. */
+/** Read JSON body from request. Resolves {} on empty or invalid JSON. */
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -59,9 +59,14 @@ function readJsonBody(req) {
     req.on('end', () => {
       try {
         const raw = Buffer.concat(chunks).toString('utf8');
-        resolve(raw ? JSON.parse(raw) : {});
+        if (!raw || !raw.trim()) {
+          resolve({});
+          return;
+        }
+        resolve(JSON.parse(raw));
       } catch (e) {
-        reject(e);
+        console.warn('[webhook] Invalid JSON body, treating as {}:', e?.message || e);
+        resolve({});
       }
     });
     req.on('error', reject);
@@ -74,6 +79,7 @@ async function handleWebhook(req, res) {
   if (secret) {
     const provided = req.headers['x-webhook-secret']?.trim();
     if (provided !== secret) {
+      console.warn('[webhook] 401 Invalid or missing X-Webhook-Secret');
       res.statusCode = 401;
       res.end(JSON.stringify({ ok: false, error: 'Invalid or missing webhook secret' }));
       return;
@@ -81,8 +87,24 @@ async function handleWebhook(req, res) {
   }
   try {
     const body = await readJsonBody(req);
-    let targetKeyParam = body.target_key?.trim();
-    if (!targetKeyParam && body.target_base_url && body.target_db && body.target_login && body.target_company_id != null) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[webhook] POST body keys:', Object.keys(body));
+    }
+
+    // Single-attachment mode: sync or delete one specific file immediately
+    if (body.attachment_id != null) {
+      const action = String(body.action || 'sync').toLowerCase();
+      console.log('[webhook] single-attachment', action, 'for attachment_id:', body.attachment_id);
+      const result = action === 'unlink' || action === 'delete'
+        ? await runDeleteAttachmentSync(body.attachment_id)
+        : await runSingleAttachmentSync(body.attachment_id);
+      res.statusCode = 200;
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    let targetKeyParam = body.target_key != null ? String(body.target_key).trim() : '';
+    if (!targetKeyParam && body.target_base_url != null && body.target_db != null && body.target_login != null && body.target_company_id != null) {
       targetKeyParam = targetKey(
         {
           baseUrl: String(body.target_base_url).trim(),
@@ -92,8 +114,14 @@ async function handleWebhook(req, res) {
         parseInt(String(body.target_company_id), 10) || 1
       );
     }
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[webhook] target:', targetKeyParam ? 'targetKey=' + targetKeyParam : 'full sync');
+    }
     const opts = targetKeyParam ? { targetKey: targetKeyParam } : {};
     const result = await runFullSync(opts);
+    if (opts.targetKey && result.target_filter === 'no_matching_route') {
+      console.warn('[webhook] target_key did not match any route. Check baseUrl (trailing slash is normalized), db, login, company_id:', targetKeyParam);
+    }
     res.statusCode = 200;
     res.end(JSON.stringify(result));
   } catch (e) {

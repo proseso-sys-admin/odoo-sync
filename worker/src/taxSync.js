@@ -69,25 +69,67 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
     ? (await odooExecuteKw(sourceCfg, 'project.task', 'read', [taskIds, ['id', ...allBucketFields]], {})) || []
     : [];
 
-  /** Extract attachment ID from Odoo M2M value: id, [id, name], or { id [, name] } */
+  /** Extract attachment ID from Odoo M2M value: id, [id, name], { id }, or (6, 0, [ids]) command */
   const m2mAttId = (v) => {
     if (v == null) return 0;
     if (typeof v === 'object' && v !== null && 'id' in v) return Number(v.id) || 0;
+    if (Array.isArray(v) && v.length === 3 && v[0] === 6 && Array.isArray(v[2])) return 0; // command, not single id
     const id = Array.isArray(v) ? (v[0] != null ? Number(v[0]) : 0) : Number(v);
-    return id && Number.isFinite(id) ? id : 0;
+    return id && Number.isFinite(id) && id > 0 ? id : 0;
   };
+  /** Collect attachment IDs from one M2M value (single id, [id,name], {id}, or (6,0,[ids])) */
+  const m2mAttIds = (v) => {
+    if (v == null) return [];
+    if (Array.isArray(v) && v.length === 3 && v[0] === 6 && Array.isArray(v[2])) {
+      return (v[2] || []).map((id) => Number(id)).filter((n) => Number.isFinite(n) && n > 0);
+    }
+    const one = m2mAttId(v);
+    return one ? [one] : [];
+  };
+
+  /** Extract all attachment IDs from a raw M2M field value (any format Odoo returns) */
+  const collectIdsFromRaw = (raw) => {
+    if (raw == null) return [];
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      if (raw.ids && Array.isArray(raw.ids)) return raw.ids.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+      if (raw.commands && Array.isArray(raw.commands)) {
+        const out = [];
+        for (const cmd of raw.commands) {
+          if (Array.isArray(cmd) && cmd.length === 3 && cmd[0] === 6 && Array.isArray(cmd[2])) {
+            for (const id of cmd[2]) out.push(Number(id));
+          }
+        }
+        return out.filter((n) => Number.isFinite(n) && n > 0);
+      }
+    }
+    if (!Array.isArray(raw) || !raw.length) return [];
+    if (raw.length === 3 && raw[0] === 6 && Array.isArray(raw[2])) return (raw[2] || []).map((id) => Number(id)).filter((n) => Number.isFinite(n) && n > 0);
+    const out = [];
+    for (const v of raw) {
+      if (v != null && typeof v === 'object' && 'id' in v) {
+        const n = Number(v.id);
+        if (n && Number.isFinite(n) && n > 0) out.push(n);
+      } else for (const id of m2mAttIds(v)) if (id && Number.isFinite(id) && id > 0) out.push(id);
+    }
+    return out;
+  };
+
   const bucketBySourceAttId = new Map();
   const fieldToBucket = { ...FIELD_TO_TAX_BUCKET, ...FIELD_TO_GVT_CONTRIB_BUCKET };
-  const taskIdToTaskWithBuckets = new Map((tasksWithBuckets || []).map((t) => [t.id, t]));
+  const taskIdToTaskWithBuckets = new Map((tasksWithBuckets || []).map((t) => [Number(t.id), t]));
+  let loggedRawSample = false;
   for (const t of tasksWithBuckets) {
     for (const fieldName of allBucketFields) {
       const bucketName = fieldToBucket[fieldName];
       if (!bucketName) continue;
       const raw = t[fieldName];
-      if (!Array.isArray(raw) || !raw.length) continue;
-      for (const v of raw) {
-        const attId = m2mAttId(v);
-        if (attId && !bucketBySourceAttId.has(attId)) bucketBySourceAttId.set(attId, bucketName);
+      const ids = collectIdsFromRaw(raw);
+      if (!loggedRawSample && raw != null && (ids.length > 0 || (Array.isArray(raw) && raw.length > 0))) {
+        console.warn('[tax] M2M raw sample field=', fieldName, 'task=', t.id, 'rawType=', Array.isArray(raw) ? 'array' : typeof raw, 'rawLength=', Array.isArray(raw) ? raw.length : 0, 'parsedIds=', ids.length, 'firstRaw=', JSON.stringify(Array.isArray(raw) ? raw[0] : raw));
+        loggedRawSample = true;
+      }
+      for (const k of ids) {
+        if (k && Number.isFinite(k) && !bucketBySourceAttId.has(k)) bucketBySourceAttId.set(k, bucketName);
       }
     }
   }
@@ -108,20 +150,24 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
       debugTax('bucketBySourceAttId sample:', entries.map(([id, b]) => `${id}->${b}`).join(', '));
     }
   }
+  if (tasksWithBuckets.length > 0 && bucketBySourceAttId.size === 0) {
+    const t0 = tasksWithBuckets[0];
+    const keys = Object.keys(t0);
+    const bucketKeys = allBucketFields.filter((f) => keys.includes(f));
+    console.warn('[tax] No attachment ids in bucket map. Task keys include bucket fields:', bucketKeys.length === allBucketFields.length, 'firstTaskKeys=', keys.slice(0, 15).join(','), 'firstTaskRawSample=', allBucketFields.map((f) => ({ f, has: f in t0, type: typeof t0[f], val: t0[f] == null ? null : (Array.isArray(t0[f]) ? 'array#' + t0[f].length : String(t0[f]).slice(0, 80)) })));
+  }
 
   /** Resolve bucket from task's M2M bucket fields when not in map (e.g. res_field empty or wrong format) */
   const getBucketForAttachment = (attId, taskId, hasTax) => {
-    if (bucketBySourceAttId.has(attId)) return bucketBySourceAttId.get(attId);
+    const k = Number(attId);
+    if (k && bucketBySourceAttId.has(k)) return bucketBySourceAttId.get(k);
     const task = taskIdToTaskWithBuckets.get(taskId);
     if (!task) return null;
     for (const fieldName of allBucketFields) {
       const bucketName = fieldToBucket[fieldName];
       if (!bucketName) continue;
-      const raw = task[fieldName];
-      if (!Array.isArray(raw) || !raw.length) continue;
-      for (const v of raw) {
-        if (m2mAttId(v) === attId) return bucketName;
-      }
+      const ids = collectIdsFromRaw(task[fieldName]);
+      if (ids.includes(k)) return bucketName;
     }
     return null;
   };
@@ -130,11 +176,12 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
   const taskToName = new Map();
   const taskToStageName = new Map();
   for (const t of tasks) {
+    const tid = Number(t.id);
     const pid = Array.isArray(t.project_id) ? t.project_id[0] : t.project_id;
-    taskToProject.set(t.id, pid);
-    taskToName.set(t.id, t.name || '');
+    taskToProject.set(tid, pid);
+    taskToName.set(tid, t.name || '');
     const st = t.stage_id;
-    taskToStageName.set(t.id, Array.isArray(st) ? String(st[1] || '') : '');
+    taskToStageName.set(tid, Array.isArray(st) ? String(st[1] || '') : '');
   }
 
   const byTarget = new Map();
@@ -142,12 +189,13 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
 
   for (const a of atts) {
     maxSeenId = Math.max(maxSeenId, Number(a.id) || 0);
-    const pid = taskToProject.get(a.res_id);
+    const taskId = Number(a.res_id);
+    const pid = taskToProject.get(taskId);
     if (!pid) { metrics.nSkipNoProject++; continue; }
     const route = routingObj[String(pid)];
     if (!route) { metrics.nSkipNoRoute++; continue; }
-    const taskName = taskToName.get(a.res_id) || '';
-    const stageUp = String(taskToStageName.get(a.res_id) || '').trim().toUpperCase();
+    const taskName = taskToName.get(taskId) || '';
+    const stageUp = String(taskToStageName.get(taskId) || '').trim().toUpperCase();
     if (stageUp !== ALLOWED_STAGE_NAME) { metrics.nSkipStage++; continue; }
     const hasTax = /Tax PH/i.test(taskName);
     const hasGvtContribs = /Gvt contribs Filing/i.test(taskName);
@@ -157,15 +205,28 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
     const k = targetKey({ baseUrl: route.target_base_url, db: route.target_db, login: route.target_login }, route.target_company_id);
     if (!byTarget.has(k)) byTarget.set(k, []);
     const parsed = parseTaxAndPeriodFromTaskName(taskName);
-    const fromMap = bucketBySourceAttId.get(a.id);
+    const fromMap = bucketBySourceAttId.get(Number(a.id));
     const fromResField = hasTax ? getTaxBucketFromResField(a.res_field) : getGvtContribBucketFromResField(a.res_field);
     let bucket = fromMap || fromResField;
-    if (!bucket) bucket = getBucketForAttachment(a.id, a.res_id, hasTax);
+    if (!bucket) bucket = getBucketForAttachment(a.id, taskId, hasTax);
     if (DEBUG) {
       const source = fromMap ? 'M2M_map' : fromResField ? 'res_field' : bucket ? 'fallback' : 'NONE';
       debugTax('att', a.id, 'res_id=', a.res_id, 'res_field=', JSON.stringify(a.res_field), 'bucket=', bucket || '(null)', 'source=', source);
     }
     byTarget.get(k).push({ a, route, taskName, parsed, bucket });
+  }
+
+  // Diagnostic: same-task attachments with different bucket = bug
+  for (const [, list] of byTarget) {
+    const byTask = new Map();
+    for (const it of list) byTask.set(Number(it.a.res_id), (byTask.get(Number(it.a.res_id)) || []).concat(it));
+    for (const [tid, items] of byTask) {
+      if (items.length < 2) continue;
+      const buckets = [...new Set(items.map((i) => i.bucket || '(null)'))];
+      if (buckets.length > 1) {
+        console.warn('[tax] SAME TASK multiple buckets task=', tid, 'attIds=', items.map((i) => i.a.id), 'buckets=', buckets, 'res_fields=', items.map((i) => i.a.res_field));
+      }
+    }
   }
 
   const targetCfgList = [];
@@ -340,4 +401,130 @@ async function runTaxGcForAllTargets(routingObj, allowedProjectsByTarget, source
   }
   const results = await Promise.all(targets);
   return { scanned: results.reduce((s, r) => s + r.scanned, 0), deleted: results.reduce((s, r) => s + r.deleted, 0) };
+}
+
+/**
+ * Sync a single attachment by id — bypasses the cursor entirely.
+ * Used by the webhook when attachment_id is provided so the specific file is synced immediately.
+ */
+export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
+  const attId = Number(attachmentId);
+  if (!attId || !Number.isFinite(attId)) return { ok: false, error: 'Invalid attachment_id' };
+
+  const atts = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[attId], ['id', 'name', 'mimetype', 'res_id', 'res_field', 'create_date']], {}) || [];
+  if (!atts.length) return { ok: false, error: 'Attachment not found in source', attachment_id: attId };
+  const a = atts[0];
+  if (!a.res_id) return { ok: false, error: 'Attachment has no res_id (not linked to a task)', attachment_id: attId };
+
+  const tasks = await odooExecuteKw(sourceCfg, 'project.task', 'read', [[a.res_id], ['id', 'project_id', 'name', 'stage_id']], {}) || [];
+  if (!tasks.length) return { ok: false, error: 'Task not found', attachment_id: attId, task_id: a.res_id };
+  const task = tasks[0];
+
+  const pid = Array.isArray(task.project_id) ? task.project_id[0] : task.project_id;
+  const routingObj = Object.fromEntries(routing);
+  const route = routingObj[String(pid)];
+  if (!route) return { ok: false, error: 'No route for project', attachment_id: attId, project_id: pid };
+
+  const taskName = task.name || '';
+  const st = task.stage_id;
+  const stageName = Array.isArray(st) ? String(st[1] || '') : '';
+  const stageUp = stageName.trim().toUpperCase();
+  if (stageUp !== ALLOWED_STAGE_NAME) return { ok: false, error: `Task stage "${stageName}" is not "${ALLOWED_STAGE_NAME}"`, attachment_id: attId };
+
+  const hasTax = /Tax PH/i.test(taskName);
+  const hasGvtContribs = /Gvt contribs Filing/i.test(taskName);
+  const hasBracketPeriod = /\[(20\d{2})(\.(0[1-9]|1[0-2]))?\]/.test(taskName);
+  if (!((hasTax || hasGvtContribs) && hasBracketPeriod)) return { ok: false, error: 'Task name does not match Tax PH or Gvt contribs pattern', attachment_id: attId, taskName };
+
+  const allBucketFields = [...TAX_BUCKET_FIELDS, ...GVT_CONTRIB_BUCKET_FIELDS];
+  const fieldToBucket = { ...FIELD_TO_TAX_BUCKET, ...FIELD_TO_GVT_CONTRIB_BUCKET };
+  const tasksWithBuckets = await odooExecuteKw(sourceCfg, 'project.task', 'read', [[a.res_id], ['id', ...allBucketFields]], {}) || [];
+
+  const collectIdsFromRaw = (raw) => {
+    if (raw == null) return [];
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      if (raw.ids && Array.isArray(raw.ids)) return raw.ids.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+      if (raw.commands && Array.isArray(raw.commands)) {
+        const out = [];
+        for (const cmd of raw.commands) if (Array.isArray(cmd) && cmd.length === 3 && cmd[0] === 6 && Array.isArray(cmd[2])) for (const id of cmd[2]) out.push(Number(id));
+        return out.filter((n) => Number.isFinite(n) && n > 0);
+      }
+    }
+    if (!Array.isArray(raw) || !raw.length) return [];
+    if (raw.length === 3 && raw[0] === 6 && Array.isArray(raw[2])) return (raw[2] || []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+    const out = [];
+    for (const v of raw) {
+      if (v != null && typeof v === 'object' && 'id' in v) { const n = Number(v.id); if (n > 0) out.push(n); }
+      else { const n = Array.isArray(v) ? Number(v[0]) : Number(v); if (n && Number.isFinite(n) && n > 0) out.push(n); }
+    }
+    return out;
+  };
+
+  let bucket = null;
+  if (tasksWithBuckets.length) {
+    const t = tasksWithBuckets[0];
+    for (const fieldName of allBucketFields) {
+      const bucketName = fieldToBucket[fieldName];
+      if (!bucketName) continue;
+      const ids = collectIdsFromRaw(t[fieldName]);
+      if (ids.includes(attId)) { bucket = bucketName; break; }
+    }
+  }
+  if (!bucket) bucket = hasTax ? getTaxBucketFromResField(a.res_field) : getGvtContribBucketFromResField(a.res_field);
+
+  const parsed = parseTaxAndPeriodFromTaskName(taskName);
+  const targetCfg = { baseUrl: route.target_base_url, db: route.target_db, login: route.target_login, password: route.target_password };
+  const companyId = requireId(route.target_company_id, { where: 'route.target_company_id' });
+
+  const marker = buildMarker(sourceCfg.db, a.id);
+  let existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
+  let targetAttachmentId;
+  if (existingAttIds.length) {
+    targetAttachmentId = requireId(existingAttIds[0], { where: 'existing target attachment' });
+  } else {
+    const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[a.id], ['datas']], {}) || [];
+    const datas = srcBin[0] && srcBin[0].datas ? srcBin[0].datas : null;
+    if (!datas) return { ok: false, error: 'Missing datas from source attachment', attachment_id: attId };
+    targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
+    targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
+  }
+
+  const destFolderId = bucket
+    ? await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName)
+    : await ensureTaxPathFolder(targetCfg, companyId, parsed.year, parsed.monthName);
+  await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+
+  return { ok: true, action: 'synced', attachment_id: attId, name: a.name, bucket: bucket || null, path: bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`, target: route.target_base_url };
+}
+
+/**
+ * Delete a single synced attachment from all targets — used when source attachment is unlinked.
+ * Searches every unique target for the marker and removes the target attachment + document.
+ */
+export async function deleteSingleAttachment(sourceCfg, routing, attachmentId) {
+  const attId = Number(attachmentId);
+  if (!attId || !Number.isFinite(attId)) return { ok: false, error: 'Invalid attachment_id' };
+
+  const marker = buildMarker(sourceCfg.db, attId);
+  const seen = new Set();
+  const results = [];
+
+  for (const [, route] of routing) {
+    const k = targetKey({ baseUrl: route.target_base_url, db: route.target_db, login: route.target_login }, route.target_company_id);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    const targetCfg = { baseUrl: route.target_base_url, db: route.target_db, login: route.target_login, password: route.target_password };
+    const companyId = requireId(route.target_company_id, { where: 'route.target_company_id' });
+    try {
+      const targetAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 10 }) || [];
+      for (const tAttId of targetAttIds) {
+        await deleteTargetDocAndAttachment(targetCfg, companyId, tAttId);
+        results.push({ target: route.target_base_url, deleted_target_att: tAttId });
+      }
+    } catch (e) {
+      results.push({ target: route.target_base_url, error: String(e?.message || e) });
+    }
+  }
+
+  return { ok: true, action: 'deleted', attachment_id: attId, targets: results };
 }
