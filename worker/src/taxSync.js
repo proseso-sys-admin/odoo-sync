@@ -65,16 +65,23 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
     ? (await odooExecuteKw(sourceCfg, 'project.task', 'read', [taskIds, ['id', ...allBucketFields]], {})) || []
     : [];
 
+  /** Extract attachment ID from Odoo M2M value (id or [id, name] tuple) */
+  const m2mAttId = (v) => {
+    if (v == null) return 0;
+    const id = Array.isArray(v) ? (v[0] ? Number(v[0]) : 0) : Number(v);
+    return id && Number.isFinite(id) ? id : 0;
+  };
   const bucketBySourceAttId = new Map();
   const fieldToBucket = { ...FIELD_TO_TAX_BUCKET, ...FIELD_TO_GVT_CONTRIB_BUCKET };
   for (const t of tasksWithBuckets) {
     for (const fieldName of allBucketFields) {
       const bucketName = fieldToBucket[fieldName];
       if (!bucketName) continue;
-      const ids = t[fieldName];
-      if (!Array.isArray(ids) || !ids.length) continue;
-      for (const attId of ids) {
-        if (!bucketBySourceAttId.has(attId)) bucketBySourceAttId.set(attId, bucketName);
+      const raw = t[fieldName];
+      if (!Array.isArray(raw) || !raw.length) continue;
+      for (const v of raw) {
+        const attId = m2mAttId(v);
+        if (attId && !bucketBySourceAttId.has(attId)) bucketBySourceAttId.set(attId, bucketName);
       }
     }
   }
