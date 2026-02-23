@@ -15,6 +15,7 @@ const GENERAL_TASK_FIELDS = [
   'x_studio_email',
   'x_studio_api_key',
   'x_studio_multi_company',
+  'x_studio_multicompany', // alternate Studio field name (no underscore)
   'x_studio_company_id_if_multi_company',
   'x_studio_accounting_database',
   'x_studio_permanent_files',
@@ -86,10 +87,10 @@ export async function loadRoutesFromOdoo(sourceCfg) {
       continue;
     }
 
-    const multiCompany = t.x_studio_multi_company === true || String(t.x_studio_multi_company || '').toLowerCase() === 'true';
-    const companyId = multiCompany
-      ? (Number(t.x_studio_company_id_if_multi_company) || 1)
-      : 1;
+    // Support both x_studio_multi_company and x_studio_multicompany; when false or missing → default to company 1
+    const multiCompanyRaw = t.x_studio_multi_company ?? t.x_studio_multicompany;
+    const multiCompany = multiCompanyRaw === true || String(multiCompanyRaw || '').toLowerCase() === 'true';
+    const companyId = multiCompany ? (Number(t.x_studio_company_id_if_multi_company) || 1) : 1;
 
     routing.set(String(pid), {
       source_project_id: Number(pid),
