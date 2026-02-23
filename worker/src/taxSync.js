@@ -462,21 +462,45 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
 
   console.log('[single-att] att res_field=', JSON.stringify(a.res_field), 'res_id=', a.res_id, 'name=', a.name);
 
-  let bucket = null;
-  if (tasksWithBuckets.length) {
-    const t = tasksWithBuckets[0];
-    const fieldDump = {};
+  const findBucketInFields = (taskData) => {
+    if (!taskData) return null;
     for (const fieldName of allBucketFields) {
-      const raw = t[fieldName];
-      const ids = collectIdsFromRaw(raw);
-      fieldDump[fieldName] = { raw: raw === false ? 'false' : raw == null ? 'null' : Array.isArray(raw) ? `array[${raw.length}]` : typeof raw, ids };
       const bucketName = fieldToBucket[fieldName];
       if (!bucketName) continue;
-      if (ids.includes(attId)) { bucket = bucketName; break; }
+      const ids = collectIdsFromRaw(taskData[fieldName]);
+      if (ids.includes(attId)) return bucketName;
+    }
+    return null;
+  };
+
+  const RETRY_DELAYS = [3000, 4000, 5000];
+  let bucket = null;
+  let attempt = 0;
+
+  // First attempt — read bucket fields immediately
+  let taskBucketData = tasksWithBuckets.length ? tasksWithBuckets[0] : null;
+  bucket = findBucketInFields(taskBucketData);
+
+  // Retry with delay: Odoo creates the attachment before updating the M2M field on the task,
+  // so the bucket link may not exist yet when the webhook fires.
+  while (!bucket && attempt < RETRY_DELAYS.length) {
+    const delay = RETRY_DELAYS[attempt];
+    console.log(`[single-att] bucket not found yet, retry ${attempt + 1}/${RETRY_DELAYS.length} after ${delay}ms...`);
+    await new Promise((r) => setTimeout(r, delay));
+    const freshTask = await odooExecuteKw(sourceCfg, 'project.task', 'read', [[a.res_id], ['id', ...allBucketFields]], {}) || [];
+    taskBucketData = freshTask.length ? freshTask[0] : null;
+    bucket = findBucketInFields(taskBucketData);
+    attempt++;
+  }
+
+  if (taskBucketData) {
+    const fieldDump = {};
+    for (const fieldName of allBucketFields) {
+      const raw = taskBucketData[fieldName];
+      const ids = collectIdsFromRaw(raw);
+      fieldDump[fieldName] = { raw: raw === false ? 'false' : raw == null ? 'null' : Array.isArray(raw) ? `array[${raw.length}]` : typeof raw, ids };
     }
     console.log('[single-att] task bucket fields:', JSON.stringify(fieldDump));
-  } else {
-    console.warn('[single-att] No bucket fields returned for task', a.res_id);
   }
 
   if (!bucket) {
@@ -484,7 +508,7 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
     if (fromResField) bucket = fromResField;
     console.log('[single-att] res_field fallback:', fromResField || '(none)');
   }
-  console.log('[single-att] resolved bucket=', bucket || '(null)');
+  console.log('[single-att] resolved bucket=', bucket || '(null)', attempt > 0 ? `(after ${attempt} retries)` : '(first try)');
 
   const parsed = parseTaxAndPeriodFromTaskName(taskName);
   const targetCfg = { baseUrl: route.target_base_url, db: route.target_db, login: route.target_login, password: route.target_password };
