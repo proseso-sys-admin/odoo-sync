@@ -75,11 +75,13 @@ function readJsonBody(req) {
 
 async function handleWebhook(req, res) {
   res.setHeader('Content-Type', 'application/json');
+  const searchParams = getSearchParams(req.url);
   const secret = process.env.WEBHOOK_SECRET?.trim();
   if (secret) {
-    const provided = req.headers['x-webhook-secret']?.trim();
-    if (provided !== secret) {
-      console.warn('[webhook] 401 Invalid or missing X-Webhook-Secret');
+    const fromHeader = req.headers['x-webhook-secret']?.trim();
+    const fromQuery = searchParams?.get('secret')?.trim();
+    if (fromHeader !== secret && fromQuery !== secret) {
+      console.warn('[webhook] 401 Invalid or missing secret');
       res.statusCode = 401;
       res.end(JSON.stringify({ ok: false, error: 'Invalid or missing webhook secret' }));
       return;
@@ -87,17 +89,19 @@ async function handleWebhook(req, res) {
   }
   try {
     const body = await readJsonBody(req);
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('[webhook] POST body keys:', Object.keys(body));
-    }
+    console.log('[webhook] POST body keys:', Object.keys(body));
 
-    // Single-attachment mode: sync or delete one specific file immediately
-    if (body.attachment_id != null) {
-      const action = String(body.action || 'sync').toLowerCase();
-      console.log('[webhook] single-attachment', action, 'for attachment_id:', body.attachment_id);
+    // Resolve attachment_id: body.attachment_id (direct), body._id (Odoo webhook notification), or body.id
+    const attId = body.attachment_id ?? body._id ?? body.id ?? null;
+    // Resolve action: body.action, query param ?action=, or default to 'sync'
+    const action = String(body.action || searchParams?.get('action') || 'sync').toLowerCase();
+
+    // Single-attachment mode when we have an attachment id and action is sync/unlink/delete
+    if (attId != null && (action === 'sync' || action === 'unlink' || action === 'delete')) {
+      console.log('[webhook] single-attachment', action, 'for attachment_id:', attId);
       const result = action === 'unlink' || action === 'delete'
-        ? await runDeleteAttachmentSync(body.attachment_id)
-        : await runSingleAttachmentSync(body.attachment_id);
+        ? await runDeleteAttachmentSync(attId)
+        : await runSingleAttachmentSync(attId);
       res.statusCode = 200;
       res.end(JSON.stringify(result));
       return;
@@ -114,9 +118,7 @@ async function handleWebhook(req, res) {
         parseInt(String(body.target_company_id), 10) || 1
       );
     }
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('[webhook] target:', targetKeyParam ? 'targetKey=' + targetKeyParam : 'full sync');
-    }
+    console.log('[webhook] target:', targetKeyParam ? 'targetKey=' + targetKeyParam : 'full sync');
     const opts = targetKeyParam ? { targetKey: targetKeyParam } : {};
     const result = await runFullSync(opts);
     if (opts.targetKey && result.target_filter === 'no_matching_route') {
