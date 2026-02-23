@@ -460,17 +460,31 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
     return out;
   };
 
+  console.log('[single-att] att res_field=', JSON.stringify(a.res_field), 'res_id=', a.res_id, 'name=', a.name);
+
   let bucket = null;
   if (tasksWithBuckets.length) {
     const t = tasksWithBuckets[0];
+    const fieldDump = {};
     for (const fieldName of allBucketFields) {
+      const raw = t[fieldName];
+      const ids = collectIdsFromRaw(raw);
+      fieldDump[fieldName] = { raw: raw === false ? 'false' : raw == null ? 'null' : Array.isArray(raw) ? `array[${raw.length}]` : typeof raw, ids };
       const bucketName = fieldToBucket[fieldName];
       if (!bucketName) continue;
-      const ids = collectIdsFromRaw(t[fieldName]);
       if (ids.includes(attId)) { bucket = bucketName; break; }
     }
+    console.log('[single-att] task bucket fields:', JSON.stringify(fieldDump));
+  } else {
+    console.warn('[single-att] No bucket fields returned for task', a.res_id);
   }
-  if (!bucket) bucket = hasTax ? getTaxBucketFromResField(a.res_field) : getGvtContribBucketFromResField(a.res_field);
+
+  if (!bucket) {
+    const fromResField = hasTax ? getTaxBucketFromResField(a.res_field) : getGvtContribBucketFromResField(a.res_field);
+    if (fromResField) bucket = fromResField;
+    console.log('[single-att] res_field fallback:', fromResField || '(none)');
+  }
+  console.log('[single-att] resolved bucket=', bucket || '(null)');
 
   const parsed = parseTaxAndPeriodFromTaskName(taskName);
   const targetCfg = { baseUrl: route.target_base_url, db: route.target_db, login: route.target_login, password: route.target_password };
@@ -479,7 +493,8 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
   const marker = buildMarker(sourceCfg.db, a.id);
   let existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
   let targetAttachmentId;
-  if (existingAttIds.length) {
+  const isExisting = existingAttIds.length > 0;
+  if (isExisting) {
     targetAttachmentId = requireId(existingAttIds[0], { where: 'existing target attachment' });
   } else {
     const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[a.id], ['datas']], {}) || [];
@@ -494,7 +509,9 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
     : await ensureTaxPathFolder(targetCfg, companyId, parsed.year, parsed.monthName);
   await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
 
-  return { ok: true, action: 'synced', attachment_id: attId, name: a.name, bucket: bucket || null, path: bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`, target: route.target_base_url };
+  const destPath = bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`;
+  console.log('[single-att] DONE att=', attId, 'target_att=', targetAttachmentId, isExisting ? '(moved)' : '(created)', 'dest=', destPath);
+  return { ok: true, action: isExisting ? 'moved' : 'synced', attachment_id: attId, name: a.name, bucket: bucket || null, path: destPath, target: route.target_base_url };
 }
 
 /**
