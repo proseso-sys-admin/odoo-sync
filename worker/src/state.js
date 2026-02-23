@@ -1,6 +1,6 @@
 /**
  * Sync state: main cursor (last_attachment_id) and per-target GC cursors.
- * Backend: single JSON file in Google Cloud Storage.
+ * Backend: Google Cloud Storage when STATE_GCS_BUCKET is set; otherwise in-memory (for local debug).
  */
 
 import { Storage } from '@google-cloud/storage';
@@ -11,6 +11,9 @@ const LAST_FULL_RESCAN_KEY = 'ODOO_SYNC_LAST_TAX_FULL_RESCAN';
 const GC_CURSOR_PREFIX = 'ODOO_SYNC_GC_LAST_TARGET_ATT_ID|';
 
 let storage = null;
+/** In-memory state when not using GCS or when GCS auth fails (local debug). */
+let memoryState = {};
+let gcsFailed = false;
 
 function getStorage() {
   if (!storage) {
@@ -22,22 +25,38 @@ function getStorage() {
   return storage;
 }
 
+function useGcs() {
+  return Boolean(STATE_GCS_BUCKET && STATE_GCS_PATH) && !gcsFailed;
+}
+
 function getFile() {
   return getStorage().bucket(STATE_GCS_BUCKET).file(STATE_GCS_PATH);
 }
 
 async function readState() {
+  if (!STATE_GCS_BUCKET || !STATE_GCS_PATH) return { ...memoryState };
+  if (gcsFailed) return { ...memoryState };
   try {
     const [buf] = await getFile().download();
     if (!buf || !buf.length) return {};
     return JSON.parse(buf.toString('utf8'));
   } catch (e) {
     if (e.code === 404) return {};
+    // 401/403 when running locally without GCP credentials: use in-memory state
+    if (e.code === 401 || e.code === 403) {
+      gcsFailed = true;
+      console.warn('[state] GCS auth failed (', e.code, '), using in-memory state for this run. Leave STATE_GCS_BUCKET empty in .env for local debug.');
+      return { ...memoryState };
+    }
     throw e;
   }
 }
 
 async function writeState(state) {
+  if (!useGcs()) {
+    memoryState = { ...state };
+    return;
+  }
   await getFile().save(JSON.stringify(state, null, 2), { contentType: 'application/json' });
 }
 

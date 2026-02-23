@@ -23,10 +23,60 @@ export async function odooAuthenticate(cfg) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  const data = await res.json();
+  const text = await res.text();
+  if (!text.trimStart().startsWith('{')) {
+    throw new Error(
+      `Odoo returned HTML instead of JSON (status ${res.status}). ` +
+      `Check SOURCE_BASE_URL: use root URL only, e.g. https://your-db.odoo.com (no /web or /web/login). ` +
+      `Got: ${text.slice(0, 80).replace(/\s+/g, ' ')}...`
+    );
+  }
+  const data = JSON.parse(text);
   if (data.error) throw new Error(`Odoo auth error: ${JSON.stringify(data.error)}`);
-  const uid = data.result;
-  if (!uid) throw new Error(`Odoo auth failed (uid falsy): ${JSON.stringify(data)}`);
+  let uid = data.result;
+  // Odoo.com (SaaS): sometimes db must be the subdomain; try deriving from URL if auth failed
+  if (!uid && cfg.db && /\.odoo\.com/i.test(cfg.baseUrl || '')) {
+    const sub = (cfg.baseUrl || '').match(/^https?:\/\/([a-z0-9-]+)\.odoo\.com/i);
+    const dbFromUrl = sub ? sub[1] : '';
+    if (dbFromUrl && dbFromUrl !== cfg.db) {
+      const altPayload = {
+        jsonrpc: '2.0',
+        method: 'call',
+        params: { service: 'common', method: 'authenticate', args: [dbFromUrl, cfg.login, cfg.password, {}] },
+        id: 1,
+      };
+      const res2 = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(altPayload),
+      });
+      const data2 = await res2.json();
+      if (data2.result) uid = data2.result;
+    }
+  }
+  // Try empty db (some Odoo.com setups expect '' as database name)
+  if (!uid && cfg.db) {
+    const altPayload = {
+      jsonrpc: '2.0',
+      method: 'call',
+      params: { service: 'common', method: 'authenticate', args: ['', cfg.login, cfg.password, {}] },
+      id: 1,
+    };
+    const res2 = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(altPayload),
+    });
+    const data2 = await res2.json();
+    if (data2.result) uid = data2.result;
+  }
+  if (!uid) {
+    throw new Error(
+      `Odoo auth failed (result false). ` +
+      `If 2FA is enabled on your account, it is NOT supported for JSON-RPC — use an API key as SOURCE_PASSWORD instead (Settings → Users → your user → Account → API Keys). ` +
+      `Otherwise check SOURCE_LOGIN and SOURCE_PASSWORD. Response: ${JSON.stringify(data)}`
+    );
+  }
   uidCache.set(key, uid);
   return uid;
 }
@@ -49,7 +99,15 @@ export async function odooExecuteKw(cfg, model, method, args = [], kwargs = {}) 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  const data = await res.json();
+  const text = await res.text();
+  if (!text.trimStart().startsWith('{')) {
+    throw new Error(
+      `Odoo returned HTML instead of JSON (status ${res.status}). ` +
+      `Check SOURCE_BASE_URL: use root URL only, e.g. https://your-db.odoo.com (no /web or /web/login). ` +
+      `Got: ${text.slice(0, 80).replace(/\s+/g, ' ')}...`
+    );
+  }
+  const data = JSON.parse(text);
   if (data.error) throw new Error(`Odoo execute_kw ${model}.${method}: ${JSON.stringify(data.error)}`);
   return data.result;
 }

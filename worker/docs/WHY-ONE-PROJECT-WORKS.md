@@ -2,6 +2,52 @@
 
 When the **source database** is the same but sync works for a **test project** and fails for **another project**, the difference is always in how that **target** is configured or what that target Odoo allows. The worker uses the same source and same code; only the target (URL, DB, credentials, company) changes per project.
 
+---
+
+## Why is nothing happening at all?
+
+If the sync runs but **no files appear** on the target (e.g. hdf-energy-holdings-incorporated), work through these in order.
+
+### 1. No routes loaded (`routes: 0`)
+
+The sync only runs for targets that have a **route**. Routes come from the **source** DB:
+
+- At least one **Tax PH** task in stage **Master** (so the project is included).
+- A **General** task in that project with **x_studio_enabled** = true, **x_studio_accounting_database** = target URL, **x_studio_email** and **x_studio_api_key** set.
+
+If the project for hdf has no such General task, or sync is disabled, or email/API key/URL is missing, **no route** is created → sync never sends anything to that target.
+
+**What to do:** Run the sync locally and watch the **console** (not only the JSON result). You should see:
+
+- `[routes] Tax PH tasks in stage "Master": N → projectIds: ...`
+- `[routes] General tasks found: ...`
+- `[routes] project X → ...` (if a project is skipped)
+- `[routes] Active routes: N (projectIds: ...)`
+
+If **Active routes: 0** or the hdf project’s ID is not in `projectIds`, fix the **General** task for that project in the source DB.
+
+**Run locally:** From the `worker` folder, set `.env` with `SOURCE_*`, then run `npm run sync`. Watch the console; the JSON will show `routes: 0` if no routes were loaded.
+
+### 2. Routes exist but nothing is processed (all skipped)
+
+An attachment is only synced if the task is in stage **APPROVED / DONE** and the task name matches **Tax PH** or **Gvt contribs Filing** with a period like **[2025]** or **[2025.01]**. Otherwise you get 0 processed and counts in `nSkipStage`, `nSkipNotTaxOrGvt`, etc.
+
+**What to do:** Check `result.tax.metrics`. Move a qualifying task to **APPROVED / DONE** and ensure the name has the bracket period.
+
+### 3. No new attachments in this batch (cursor)
+
+The worker only fetches attachments with **id > lastId**. If there are no new attachments since the last run, the batch is empty and no new files are created.
+
+**What to do:** Add a new attachment in the source, or set `ODOO_SYNC_RESET_TAX_CURSOR=1` for one run to rescan from the start (then unset it).
+
+### 4. Target errors (auth, Documents, permissions)
+
+Errors for a specific target are in **`result.tax.failures`**. Common causes: wrong API key/email, or target has no Documents app / API user has no rights.
+
+**What to do:** Inspect `result.tax.failures` after a run. Log in to the target with the same email/API key and ensure Documents is installed and the user can create documents in that company.
+
+---
+
 ## 1. Route not created for the other project
 
 The worker only syncs to targets that appear in **routes**. A route is created only when **in the source DB**:

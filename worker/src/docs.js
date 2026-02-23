@@ -11,16 +11,17 @@ function kwWithCompany(companyId, extraKw = {}) {
 
 async function assertFolderDoc(targetCfg, companyId, docId, ctx = {}) {
   const id = requireId(docId, { where: 'assertFolderDoc', ...ctx });
+  // Odoo 19: no is_folder field; type === 'folder' is enough
   const rows = await odooExecuteKw(
     targetCfg,
     'documents.document',
     'read',
-    [[id], ['id', 'name', 'type', 'is_folder', 'folder_id', 'company_id', 'owner_id']],
+    [[id], ['id', 'name', 'type', 'folder_id', 'company_id', 'owner_id']],
     kwWithCompany(companyId)
   );
   const d = (rows && rows[0]) || null;
   if (!d) throw new Error('Folder doc not found: ' + JSON.stringify({ id, ctx }));
-  const isFolder = (String(d.type || '').toLowerCase() === 'folder') || !!d.is_folder;
+  const isFolder = String(d.type || '').toLowerCase() === 'folder';
   if (!isFolder) throw new Error('Resolved folder is not a folder: ' + JSON.stringify({ got: d, ctx }));
   return id;
 }

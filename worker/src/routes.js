@@ -8,6 +8,7 @@ import { odooExecuteKw, parseAcctDb, isFalsyOdooValue } from './odoo.js';
 const ROUTING_STAGE_NAME = 'Master';
 const GENERAL_TASK_NAME = 'General';
 
+// Only request fields that exist on source DB (x_studio_multicompany may not exist; we fall back to x_studio_multi_company in code)
 const GENERAL_TASK_FIELDS = [
   'id',
   'project_id',
@@ -15,7 +16,6 @@ const GENERAL_TASK_FIELDS = [
   'x_studio_email',
   'x_studio_api_key',
   'x_studio_multi_company',
-  'x_studio_multicompany', // alternate Studio field name (no underscore)
   'x_studio_company_id_if_multi_company',
   'x_studio_accounting_database',
   'x_studio_permanent_files',

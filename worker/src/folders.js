@@ -22,11 +22,12 @@ export async function findOrCreateFolder(targetCfg, companyId, name, parentFolde
     kwWithCompany(companyId, { limit: 1 })
   );
   if (ids && ids.length) return requireId(ids[0], { where: 'folder existing', name, parentId });
+  // Odoo 19 Documents: no is_folder field on create; type: 'folder' is enough
   const createdId = await odooExecuteKw(
     targetCfg,
     'documents.document',
     'create',
-    [[{ name: String(name), type: 'folder', is_folder: true, folder_id: parentId, company_id: companyId, owner_id: false }]],
+    [[{ name: String(name), type: 'folder', folder_id: parentId, company_id: companyId, owner_id: false }]],
     kwWithCompany(companyId)
   );
   return requireId(createdId, { where: 'folder created', name, parentId });

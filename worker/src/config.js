@@ -1,8 +1,14 @@
 /**
  * Config from env (Cloud Run / Secret Manager injects these).
- * Loads .env from cwd when running locally.
+ * Loads .env from worker root so it works regardless of process cwd.
  */
-import 'dotenv/config';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import dotenv from 'dotenv';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const envPath = join(__dirname, '..', '.env');
+dotenv.config({ path: envPath });
 
 function getEnv(name, def = '') {
   const v = process.env[name];
@@ -16,6 +22,11 @@ export function getSourceConfig() {
   const password = getEnv('SOURCE_PASSWORD');
   if (!baseUrl || !db || !login || !password) {
     throw new Error('Missing SOURCE_* env: SOURCE_BASE_URL, SOURCE_DB, SOURCE_LOGIN, SOURCE_PASSWORD');
+  }
+  if (process.env.ODOO_SYNC_DEBUG) {
+    console.error('[config] .env path:', envPath);
+    console.error('[config] SOURCE_BASE_URL:', baseUrl);
+    console.error('[config] SOURCE_DB:', db);
   }
   return { baseUrl, db, login, password };
 }
