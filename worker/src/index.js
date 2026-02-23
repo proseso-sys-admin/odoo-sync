@@ -6,7 +6,7 @@
  */
 
 import http from 'http';
-import { runFullSync, runSingleAttachmentSync, runDeleteAttachmentSync } from './runSync.js';
+import { runFullSync, runSingleAttachmentSync, runDeleteAttachmentSync, runTaskAttachmentsSync } from './runSync.js';
 import { targetKey } from './odoo.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -91,20 +91,30 @@ async function handleWebhook(req, res) {
     const body = await readJsonBody(req);
     console.log('[webhook] POST body keys:', Object.keys(body));
 
-    // Resolve attachment_id: body.attachment_id (direct), body._id (Odoo webhook notification), or body.id
-    const attId = body.attachment_id ?? body._id ?? body.id ?? null;
-    // Resolve action: body.action, query param ?action=, or default to 'sync'
+    const model = String(body._model || body.model || '').toLowerCase();
+    const recordId = body.attachment_id ?? body.task_id ?? body._id ?? body.id ?? null;
     const action = String(body.action || searchParams?.get('action') || 'sync').toLowerCase();
 
-    // Single-attachment mode when we have an attachment id and action is sync/unlink/delete
-    if (attId != null && (action === 'sync' || action === 'unlink' || action === 'delete')) {
-      console.log('[webhook] single-attachment', action, 'for attachment_id:', attId);
-      const result = action === 'unlink' || action === 'delete'
-        ? await runDeleteAttachmentSync(attId)
-        : await runSingleAttachmentSync(attId);
+    // Task-based sync: Odoo "Send Webhook Notification" on project.task write
+    if (model === 'project.task' && recordId != null) {
+      console.log('[webhook] task-sync for task_id:', recordId);
+      const result = await runTaskAttachmentsSync(recordId);
       res.statusCode = 200;
       res.end(JSON.stringify(result));
       return;
+    }
+
+    // Single-attachment mode (direct API call or ir.attachment webhook)
+    if (recordId != null && (action === 'sync' || action === 'unlink' || action === 'delete')) {
+      if (model === 'ir.attachment' || !model) {
+        console.log('[webhook] single-attachment', action, 'for attachment_id:', recordId);
+        const result = action === 'unlink' || action === 'delete'
+          ? await runDeleteAttachmentSync(recordId)
+          : await runSingleAttachmentSync(recordId);
+        res.statusCode = 200;
+        res.end(JSON.stringify(result));
+        return;
+      }
     }
 
     let targetKeyParam = body.target_key != null ? String(body.target_key).trim() : '';

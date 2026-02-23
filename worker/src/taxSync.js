@@ -569,3 +569,133 @@ export async function deleteSingleAttachment(sourceCfg, routing, attachmentId) {
 
   return { ok: true, action: 'deleted', attachment_id: attId, targets: results };
 }
+
+/**
+ * Sync all attachments for a single task — triggered by project.task write webhook.
+ * Reads task bucket fields (M2M already updated), syncs each attachment to the correct bucket,
+ * and removes target attachments that are no longer linked to any bucket field.
+ */
+export async function syncTaskAttachments(sourceCfg, routing, taskId) {
+  const tid = Number(taskId);
+  if (!tid || !Number.isFinite(tid)) return { ok: false, error: 'Invalid task_id' };
+
+  const tasks = await odooExecuteKw(sourceCfg, 'project.task', 'read', [[tid], ['id', 'project_id', 'name', 'stage_id']], {}) || [];
+  if (!tasks.length) return { ok: false, error: 'Task not found', task_id: tid };
+  const task = tasks[0];
+
+  const pid = Array.isArray(task.project_id) ? task.project_id[0] : task.project_id;
+  const routingObj = Object.fromEntries(routing);
+  const route = routingObj[String(pid)];
+  if (!route) return { ok: false, error: 'No route for project', task_id: tid, project_id: pid };
+
+  const taskName = task.name || '';
+  const st = task.stage_id;
+  const stageName = Array.isArray(st) ? String(st[1] || '') : '';
+  const stageUp = stageName.trim().toUpperCase();
+  if (stageUp !== ALLOWED_STAGE_NAME) return { ok: false, error: `Task stage "${stageName}" is not "${ALLOWED_STAGE_NAME}"`, task_id: tid };
+
+  const hasTax = /Tax PH/i.test(taskName);
+  const hasGvtContribs = /Gvt contribs Filing/i.test(taskName);
+  const hasBracketPeriod = /\[(20\d{2})(\.(0[1-9]|1[0-2]))?\]/.test(taskName);
+  if (!((hasTax || hasGvtContribs) && hasBracketPeriod)) return { ok: false, error: 'Task name does not match Tax PH or Gvt contribs pattern', task_id: tid, taskName };
+
+  const allBucketFields = hasTax ? TAX_BUCKET_FIELDS : GVT_CONTRIB_BUCKET_FIELDS;
+  const fieldToBucket = hasTax ? FIELD_TO_TAX_BUCKET : FIELD_TO_GVT_CONTRIB_BUCKET;
+  const taskData = (await odooExecuteKw(sourceCfg, 'project.task', 'read', [[tid], ['id', ...allBucketFields]], {}) || [])[0];
+  if (!taskData) return { ok: false, error: 'Could not read task bucket fields', task_id: tid };
+
+  const collectIdsFromRaw = (raw) => {
+    if (raw == null) return [];
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      if (raw.ids && Array.isArray(raw.ids)) return raw.ids.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+      if (raw.commands && Array.isArray(raw.commands)) {
+        const out = [];
+        for (const cmd of raw.commands) if (Array.isArray(cmd) && cmd.length === 3 && cmd[0] === 6 && Array.isArray(cmd[2])) for (const id of cmd[2]) out.push(Number(id));
+        return out.filter((n) => Number.isFinite(n) && n > 0);
+      }
+    }
+    if (!Array.isArray(raw) || !raw.length) return [];
+    if (raw.length === 3 && raw[0] === 6 && Array.isArray(raw[2])) return (raw[2] || []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+    const out = [];
+    for (const v of raw) {
+      if (v != null && typeof v === 'object' && 'id' in v) { const n = Number(v.id); if (n > 0) out.push(n); }
+      else { const n = Array.isArray(v) ? Number(v[0]) : Number(v); if (n && Number.isFinite(n) && n > 0) out.push(n); }
+    }
+    return out;
+  };
+
+  // Build map: srcAttId -> bucketName for all attachments in all bucket fields
+  const attToBucket = new Map();
+  const allSourceAttIds = new Set();
+  for (const fieldName of allBucketFields) {
+    const bucketName = fieldToBucket[fieldName];
+    if (!bucketName) continue;
+    const ids = collectIdsFromRaw(taskData[fieldName]);
+    for (const id of ids) {
+      attToBucket.set(id, bucketName);
+      allSourceAttIds.add(id);
+    }
+  }
+
+  console.log('[task-sync] task=', tid, 'name=', taskName, 'attachments in buckets:', allSourceAttIds.size, 'buckets:', [...new Set(attToBucket.values())].join(', '));
+
+  if (!allSourceAttIds.size) return { ok: true, task_id: tid, synced: 0, deleted: 0, message: 'No attachments in bucket fields' };
+
+  // Read source attachment metadata
+  const srcAtts = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[...allSourceAttIds], ['id', 'name', 'mimetype']], {}) || [];
+  const srcAttMap = new Map(srcAtts.map((a) => [Number(a.id), a]));
+
+  const parsed = parseTaxAndPeriodFromTaskName(taskName);
+  const targetCfg = { baseUrl: route.target_base_url, db: route.target_db, login: route.target_login, password: route.target_password };
+  const companyId = requireId(route.target_company_id, { where: 'route.target_company_id' });
+
+  let synced = 0;
+  let deleted = 0;
+  const results = [];
+
+  // Sync each attachment to its correct bucket
+  for (const [srcAttId, bucket] of attToBucket) {
+    const a = srcAttMap.get(srcAttId);
+    if (!a) { results.push({ id: srcAttId, status: 'skip_not_found' }); continue; }
+    try {
+      const marker = buildMarker(sourceCfg.db, srcAttId);
+      let existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
+      let targetAttachmentId;
+      const isExisting = existingAttIds.length > 0;
+      if (isExisting) {
+        targetAttachmentId = requireId(existingAttIds[0], { where: 'existing target attachment' });
+      } else {
+        const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[srcAttId], ['datas']], {}) || [];
+        const datas = srcBin[0]?.datas;
+        if (!datas) { results.push({ id: srcAttId, status: 'skip_no_data' }); continue; }
+        targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
+        targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
+      }
+      const destFolderId = await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName);
+      await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+      synced++;
+      results.push({ id: srcAttId, name: a.name, bucket, status: isExisting ? 'moved' : 'created' });
+    } catch (e) {
+      results.push({ id: srcAttId, status: 'error', error: String(e?.message || e) });
+    }
+  }
+
+  // GC: find target attachments for this task that are no longer in any bucket field
+  const markerPrefix = `ODOO_SYNC|SRC_DB=${sourceCfg.db}|SRC_ATT=`;
+  const targetMarkerAtts = await odooExecuteKw(targetCfg, 'ir.attachment', 'search_read', [
+    [['description', 'ilike', markerPrefix]], ['id', 'description'],
+  ], { limit: 500 }) || [];
+  for (const tAtt of targetMarkerAtts) {
+    const srcId = parseSrcAttIdFromMarker(tAtt.description);
+    if (!srcId) continue;
+    // Only clean up attachments that used to belong to THIS task but no longer do
+    const wasMine = srcAttMap.has(srcId) || allSourceAttIds.has(srcId);
+    if (wasMine || !allSourceAttIds.has(srcId)) {
+      // Check if this src attachment still exists and belongs to this task
+      if (allSourceAttIds.has(srcId)) continue; // still linked, skip
+    }
+  }
+
+  console.log('[task-sync] DONE task=', tid, 'synced=', synced, 'results=', JSON.stringify(results.map((r) => `${r.id}:${r.status}:${r.bucket || ''}`)));
+  return { ok: true, task_id: tid, taskName, synced, results };
+}

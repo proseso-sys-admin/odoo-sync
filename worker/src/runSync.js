@@ -6,7 +6,7 @@
 
 import { getSourceConfig } from './config.js';
 import { loadRoutesFromOdoo } from './routes.js';
-import { runTaxSync, syncSingleAttachment, deleteSingleAttachment } from './taxSync.js';
+import { runTaxSync, syncSingleAttachment, deleteSingleAttachment, syncTaskAttachments } from './taxSync.js';
 import { runOnboardingSync } from './onboardingSync.js';
 import { MAX_CONCURRENT_TARGETS } from './config.js';
 import { routeKey } from './odoo.js';
@@ -81,4 +81,16 @@ export async function runDeleteAttachmentSync(attachmentId) {
   const routing = await loadRoutesFromOdoo(sourceCfg);
   if (!routing.size) return { ok: false, error: 'no_routes' };
   return deleteSingleAttachment(sourceCfg, routing, attachmentId);
+}
+
+/**
+ * Sync all attachments for a task (triggered by project.task write webhook).
+ * @param {number|string} taskId - Source task ID
+ * @returns {Promise<object>}
+ */
+export async function runTaskAttachmentsSync(taskId) {
+  const sourceCfg = getSourceConfig();
+  const routing = await loadRoutesFromOdoo(sourceCfg);
+  if (!routing.size) return { ok: false, error: 'no_routes' };
+  return syncTaskAttachments(sourceCfg, routing, taskId);
 }
