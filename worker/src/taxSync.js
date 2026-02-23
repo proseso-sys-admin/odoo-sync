@@ -11,6 +11,10 @@ import { upsertMoveDocumentForAttachment, deleteTargetDocAndAttachment } from '.
 import { ATTACHMENT_BATCH_LIMIT } from './config.js';
 
 const ALLOWED_STAGE_NAME = 'APPROVED / DONE';
+const DEBUG = process.env.ODOO_SYNC_DEBUG === '1' || process.env.ODOO_SYNC_DEBUG === 'true';
+function debugTax(...args) {
+  if (DEBUG) console.warn('[tax-debug]', ...args);
+}
 
 /**
  * Run Tax PH sync + GC. Uses sourceCfg and routing (Map). Updates cursor and GC cursors.
@@ -65,14 +69,16 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
     ? (await odooExecuteKw(sourceCfg, 'project.task', 'read', [taskIds, ['id', ...allBucketFields]], {})) || []
     : [];
 
-  /** Extract attachment ID from Odoo M2M value (id or [id, name] tuple) */
+  /** Extract attachment ID from Odoo M2M value: id, [id, name], or { id [, name] } */
   const m2mAttId = (v) => {
     if (v == null) return 0;
-    const id = Array.isArray(v) ? (v[0] ? Number(v[0]) : 0) : Number(v);
+    if (typeof v === 'object' && v !== null && 'id' in v) return Number(v.id) || 0;
+    const id = Array.isArray(v) ? (v[0] != null ? Number(v[0]) : 0) : Number(v);
     return id && Number.isFinite(id) ? id : 0;
   };
   const bucketBySourceAttId = new Map();
   const fieldToBucket = { ...FIELD_TO_TAX_BUCKET, ...FIELD_TO_GVT_CONTRIB_BUCKET };
+  const taskIdToTaskWithBuckets = new Map((tasksWithBuckets || []).map((t) => [t.id, t]));
   for (const t of tasksWithBuckets) {
     for (const fieldName of allBucketFields) {
       const bucketName = fieldToBucket[fieldName];
@@ -85,6 +91,40 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
       }
     }
   }
+
+  if (DEBUG) {
+    debugTax('tasksWithBuckets count:', tasksWithBuckets.length, '| bucketBySourceAttId size:', bucketBySourceAttId.size);
+    if (tasksWithBuckets.length) {
+      const t0 = tasksWithBuckets[0];
+      const sample = {};
+      for (const fn of allBucketFields) {
+        const raw = t0[fn];
+        if (raw != null && Array.isArray(raw) && raw.length) sample[fn] = { length: raw.length, first: raw[0], type: typeof raw[0] };
+      }
+      debugTax('sample task id=', t0.id, 'bucket fields sample:', JSON.stringify(sample));
+    }
+    if (bucketBySourceAttId.size) {
+      const entries = [...bucketBySourceAttId.entries()].slice(0, 5);
+      debugTax('bucketBySourceAttId sample:', entries.map(([id, b]) => `${id}->${b}`).join(', '));
+    }
+  }
+
+  /** Resolve bucket from task's M2M bucket fields when not in map (e.g. res_field empty or wrong format) */
+  const getBucketForAttachment = (attId, taskId, hasTax) => {
+    if (bucketBySourceAttId.has(attId)) return bucketBySourceAttId.get(attId);
+    const task = taskIdToTaskWithBuckets.get(taskId);
+    if (!task) return null;
+    for (const fieldName of allBucketFields) {
+      const bucketName = fieldToBucket[fieldName];
+      if (!bucketName) continue;
+      const raw = task[fieldName];
+      if (!Array.isArray(raw) || !raw.length) continue;
+      for (const v of raw) {
+        if (m2mAttId(v) === attId) return bucketName;
+      }
+    }
+    return null;
+  };
 
   const taskToProject = new Map();
   const taskToName = new Map();
@@ -117,8 +157,14 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
     const k = targetKey({ baseUrl: route.target_base_url, db: route.target_db, login: route.target_login }, route.target_company_id);
     if (!byTarget.has(k)) byTarget.set(k, []);
     const parsed = parseTaxAndPeriodFromTaskName(taskName);
-    const bucket = bucketBySourceAttId.get(a.id) ||
-      (hasTax ? getTaxBucketFromResField(a.res_field) : getGvtContribBucketFromResField(a.res_field));
+    const fromMap = bucketBySourceAttId.get(a.id);
+    const fromResField = hasTax ? getTaxBucketFromResField(a.res_field) : getGvtContribBucketFromResField(a.res_field);
+    let bucket = fromMap || fromResField;
+    if (!bucket) bucket = getBucketForAttachment(a.id, a.res_id, hasTax);
+    if (DEBUG) {
+      const source = fromMap ? 'M2M_map' : fromResField ? 'res_field' : bucket ? 'fallback' : 'NONE';
+      debugTax('att', a.id, 'res_id=', a.res_id, 'res_field=', JSON.stringify(a.res_field), 'bucket=', bucket || '(null)', 'source=', source);
+    }
     byTarget.get(k).push({ a, route, taskName, parsed, bucket });
   }
 
@@ -159,6 +205,7 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
         const destFolderId = bucket
           ? await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName)
           : await ensureTaxPathFolder(targetCfg, companyId, parsed.year, parsed.monthName);
+        if (DEBUG) debugTax('dest folder att=', a.id, 'bucket=', bucket || '(no bucket)', 'path=', bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`);
         await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
         metrics.nProcessed++;
         metrics.nCreatedOrMoved++;
