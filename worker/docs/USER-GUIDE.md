@@ -307,6 +307,20 @@ Follow these steps in your **source** Odoo database. You can either trigger **fu
 - Worker URL for this project: `https://odoo-sync-worker-njiacix2yq-as.a.run.app` (or run `gcloud run services describe odoo-sync-worker --region=asia-southeast1 --format="value(status.url)"` to get it).
 - (Optional) If you use a webhook secret, know the value you set as `WEBHOOK_SECRET` on the worker.
 
+### Making delete work when using task-based webhook (project.task)
+
+If you use **Send Webhook Notification** on **project.task** (On create and edit) only, the worker never receives the **deleted** attachment id (the attachment is already unlinked from the task), so it cannot remove that file from the target. To get **instant delete** on webhook:
+
+1. Add a **second** automated action in Odoo:
+   - **Model:** Attachment (`ir.attachment`)
+   - **Trigger:** **On delete**
+   - **Domain:** `[('res_model', '=', 'project.task')]` (optional, so only task attachments trigger)
+   - **Action:** **Send Webhook Notification**
+   - **URL:** your worker webhook URL (e.g. `https://.../webhook`)
+   - **Body:** must include the deleted record id and action. Depending on your Odoo version, the webhook may send `_model`, `_id` and optionally `action`. If you can set the body manually, send e.g. `{"_model": "ir.attachment", "_id": <record id>, "action": "unlink"}`. The worker accepts the attachment id in `_id`, `id`, or `record_id`.
+
+2. If your automation uses **Execute Python Code** instead of Send Webhook Notification, when the trigger is **On delete**, include in the payload `attachment_id`: `record.id` and `action`: `"unlink"`, so the worker runs the delete path.
+
 ---
 
 ### Step 1: Open Automation

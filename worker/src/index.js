@@ -92,8 +92,9 @@ async function handleWebhook(req, res) {
     console.log('[webhook] POST body keys:', Object.keys(body));
 
     const model = String(body._model || body.model || '').toLowerCase();
-    const recordId = body.attachment_id ?? body.task_id ?? body._id ?? body.id ?? null;
     const action = String(body.action || searchParams?.get('action') || 'sync').toLowerCase();
+    // recordId: task_id for task sync, attachment_id for single-attachment/delete (Odoo may send id, _id, record_id)
+    const recordId = body.attachment_id ?? body.task_id ?? body._id ?? body.id ?? body.record_id ?? (body.record && (body.record.id ?? body.record.ids?.[0])) ?? null;
 
     // Task-based sync: Odoo "Send Webhook Notification" on project.task write
     if (model === 'project.task' && recordId != null) {
@@ -104,7 +105,8 @@ async function handleWebhook(req, res) {
       return;
     }
 
-    // Single-attachment mode (direct API call or ir.attachment webhook)
+    // Single-attachment mode (direct API call or ir.attachment webhook).
+    // For delete to work: Odoo must send a webhook when an attachment is deleted (automation on ir.attachment, trigger "On delete") with action=unlink|delete and the attachment id in _id, id, or record_id.
     if (recordId != null && (action === 'sync' || action === 'unlink' || action === 'delete')) {
       if (model === 'ir.attachment' || !model) {
         console.log('[webhook] single-attachment', action, 'for attachment_id:', recordId);
