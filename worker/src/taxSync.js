@@ -639,10 +639,10 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
 
   console.log('[task-sync] task=', tid, 'name=', taskName, 'attachments in buckets:', allSourceAttIds.size, 'buckets:', [...new Set(attToBucket.values())].join(', '));
 
-  if (!allSourceAttIds.size) return { ok: true, task_id: tid, synced: 0, deleted: 0, message: 'No attachments in bucket fields' };
-
   // Read source attachment metadata
-  const srcAtts = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[...allSourceAttIds], ['id', 'name', 'mimetype']], {}) || [];
+  const srcAtts = allSourceAttIds.size
+    ? await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[...allSourceAttIds], ['id', 'name', 'mimetype']], {}) || []
+    : [];
   const srcAttMap = new Map(srcAtts.map((a) => [Number(a.id), a]));
 
   const parsed = parseTaxAndPeriodFromTaskName(taskName);
@@ -680,22 +680,27 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
     }
   }
 
-  // GC: find target attachments for this task that are no longer in any bucket field
-  const markerPrefix = `ODOO_SYNC|SRC_DB=${sourceCfg.db}|SRC_ATT=`;
-  const targetMarkerAtts = await odooExecuteKw(targetCfg, 'ir.attachment', 'search_read', [
-    [['description', 'ilike', markerPrefix]], ['id', 'description'],
+  // GC: delete target attachments for source attachments that are on this task but no longer in any bucket field
+  const allTaskAttIds = await odooExecuteKw(sourceCfg, 'ir.attachment', 'search', [
+    [['res_model', '=', 'project.task'], ['res_id', '=', tid], ['type', '=', 'binary']],
   ], { limit: 500 }) || [];
-  for (const tAtt of targetMarkerAtts) {
-    const srcId = parseSrcAttIdFromMarker(tAtt.description);
-    if (!srcId) continue;
-    // Only clean up attachments that used to belong to THIS task but no longer do
-    const wasMine = srcAttMap.has(srcId) || allSourceAttIds.has(srcId);
-    if (wasMine || !allSourceAttIds.has(srcId)) {
-      // Check if this src attachment still exists and belongs to this task
-      if (allSourceAttIds.has(srcId)) continue; // still linked, skip
+  const orphanedSrcIds = allTaskAttIds.map(Number).filter((id) => id && !allSourceAttIds.has(id));
+
+  for (const srcId of orphanedSrcIds) {
+    const marker = buildMarker(sourceCfg.db, srcId);
+    const targetAtts = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 5 }) || [];
+    for (const tAttId of targetAtts) {
+      try {
+        await deleteTargetDocAndAttachment(targetCfg, companyId, tAttId);
+        deleted++;
+        results.push({ id: srcId, status: 'deleted', target_att: tAttId });
+        console.log('[task-sync] deleted target att', tAttId, 'for orphaned source att', srcId);
+      } catch (e) {
+        results.push({ id: srcId, status: 'delete_error', error: String(e?.message || e) });
+      }
     }
   }
 
-  console.log('[task-sync] DONE task=', tid, 'synced=', synced, 'results=', JSON.stringify(results.map((r) => `${r.id}:${r.status}:${r.bucket || ''}`)));
-  return { ok: true, task_id: tid, taskName, synced, results };
+  console.log('[task-sync] DONE task=', tid, 'synced=', synced, 'deleted=', deleted);
+  return { ok: true, task_id: tid, taskName, synced, deleted, results };
 }
