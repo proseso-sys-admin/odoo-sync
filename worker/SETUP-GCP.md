@@ -109,7 +109,7 @@ Deploying from GitHub is often **better**: no need for Docker or gcloud on your 
 
 1. **First-time setup** (once per project):
    - Do a **one-time deploy** with Option A or B below so the Cloud Run service exists and has env vars/secrets set.
-   - **Connect the repo**: [Cloud Build → Repositories](https://console.cloud.google.com/cloud-build/repositories) → **1st gen** tab → **Connect repository** → GitHub → install/authorize the Cloud Build app → select **josephnrqzproseso** / **odoo-sync** → Connect.
+   - **Connect the repo**: [Cloud Build → Repositories](https://console.cloud.google.com/cloud-build/repositories) → **1st gen** tab → **Connect repository** → GitHub → install/authorize the Cloud Build app → select **proseso-sys-admin** / **odoo-sync** → Connect.
    - **Create the trigger** (Console is most reliable; `gcloud` often returns INVALID_ARGUMENT for GitHub triggers):
      - [Cloud Build → Triggers](https://console.cloud.google.com/cloud-build/triggers) → **Create trigger**.
      - Name: `odoo-sync-deploy`. Region: **asia-southeast1** (or your chosen region).
@@ -121,6 +121,19 @@ Deploying from GitHub is often **better**: no need for Docker or gcloud on your 
    - Ensure the Artifact Registry repo exists (Option B step) and the Cloud Build service account can push images and deploy to Cloud Run.
 
 2. **Each deploy**: push to `master`, or in Triggers click **Run** on `odoo-sync-deploy`. Env and secrets on the Cloud Run service are unchanged.
+
+**Relink after GitHub username change (e.g. to proseso-sys-admin)**
+
+1. In GCP: [Cloud Build → Repositories](https://console.cloud.google.com/cloud-build/repositories) (1st gen) — **delete** the old linked **odoo-sync** repo if it points at the old GitHub user.
+2. **Connect repository** again → GitHub → authorize if needed → select **proseso-sys-admin** / **odoo-sync** → Connect.
+3. [Cloud Build → Triggers](https://console.cloud.google.com/cloud-build/triggers) — delete the old **odoo-sync-deploy** trigger, then **Create trigger**:
+   - Name: `odoo-sync-deploy`
+   - Region: **asia-southeast1**
+   - Event: **Push to a branch**, branch `^master$`
+   - Source: 1st gen, Repository: **odoo-sync** (the one you just connected)
+   - Config: **Cloud Build configuration file** → `worker/cloudbuild.yaml`
+   - Substitutions (optional): `_SERVICE_NAME` = `odoo-sync-worker`, `_REGION` = `asia-southeast1`
+   - Create.
 
 **Create trigger via gcloud (2nd gen — use these commands):**
 
@@ -147,7 +160,7 @@ gcloud builds connections create github $CONNECTION --region=$REGION
 
 # 2) Link the repo to the connection
 gcloud builds repositories create odoo-sync `
-  --remote-uri="https://github.com/josephnrqzproseso/odoo-sync.git" `
+  --remote-uri="https://github.com/proseso-sys-admin/odoo-sync.git" `
   --connection=$CONNECTION `
   --region=$REGION
 
