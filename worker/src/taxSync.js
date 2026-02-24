@@ -653,13 +653,13 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
   let deleted = 0;
   const results = [];
 
-  // Sync each attachment to its correct bucket
-  for (const [srcAttId, bucket] of attToBucket) {
+  // Sync all attachments in parallel — folder cache + lock prevents duplicate folder creation
+  const syncJobs = [...attToBucket.entries()].map(async ([srcAttId, bucket]) => {
     const a = srcAttMap.get(srcAttId);
-    if (!a) { results.push({ id: srcAttId, status: 'skip_not_found' }); continue; }
+    if (!a) { results.push({ id: srcAttId, status: 'skip_not_found' }); return; }
     try {
       const marker = buildMarker(sourceCfg.db, srcAttId);
-      let existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
+      const existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
       let targetAttachmentId;
       const isExisting = existingAttIds.length > 0;
       if (isExisting) {
@@ -667,7 +667,7 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
       } else {
         const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[srcAttId], ['datas']], {}) || [];
         const datas = srcBin[0]?.datas;
-        if (!datas) { results.push({ id: srcAttId, status: 'skip_no_data' }); continue; }
+        if (!datas) { results.push({ id: srcAttId, status: 'skip_no_data' }); return; }
         targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
         targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
       }
@@ -678,15 +678,19 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
     } catch (e) {
       results.push({ id: srcAttId, status: 'error', error: String(e?.message || e) });
     }
-  }
+  });
+  await Promise.all(syncJobs);
 
-  // GC: delete target attachments for source attachments that are on this task but no longer in any bucket field
+  // GC: find all synced target attachments for this task, delete any whose source is not in a bucket field
+  const markerPrefix = `ODOO_SYNC|SRC_DB=${sourceCfg.db}|SRC_ATT=`;
   const allTaskAttIds = await odooExecuteKw(sourceCfg, 'ir.attachment', 'search', [
     [['res_model', '=', 'project.task'], ['res_id', '=', tid], ['type', '=', 'binary']],
   ], { limit: 500 }) || [];
-  const orphanedSrcIds = allTaskAttIds.map(Number).filter((id) => id && !allSourceAttIds.has(id));
+  const allTaskAttSet = new Set(allTaskAttIds.map(Number));
 
-  for (const srcId of orphanedSrcIds) {
+  // Build markers for all task attachments NOT in bucket fields → search target in one batch
+  const orphanedSrcIds = [...allTaskAttSet].filter((id) => id && !allSourceAttIds.has(id));
+  const deleteJobs = orphanedSrcIds.map(async (srcId) => {
     const marker = buildMarker(sourceCfg.db, srcId);
     const targetAtts = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 5 }) || [];
     for (const tAttId of targetAtts) {
@@ -694,12 +698,13 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
         await deleteTargetDocAndAttachment(targetCfg, companyId, tAttId);
         deleted++;
         results.push({ id: srcId, status: 'deleted', target_att: tAttId });
-        console.log('[task-sync] deleted target att', tAttId, 'for orphaned source att', srcId);
       } catch (e) {
         results.push({ id: srcId, status: 'delete_error', error: String(e?.message || e) });
       }
     }
-  }
+  });
+  await Promise.all(deleteJobs);
+  if (deleted) console.log('[task-sync] deleted', deleted, 'orphaned attachments');
 
   console.log('[task-sync] DONE task=', tid, 'synced=', synced, 'deleted=', deleted);
   return { ok: true, task_id: tid, taskName, synced, deleted, results };
