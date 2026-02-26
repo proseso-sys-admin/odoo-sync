@@ -58,6 +58,8 @@ Routing is read from the source Odoo **General** task (Sync tab): `x_studio_enab
 
 ## Deploy (Cloud Run)
 
+**Canonical GitHub repo:** `https://github.com/proseso-sys-admin/odoo-sync` — use this as `origin` for push/pull.
+
 - **From GitHub (recommended):** Connect the repo to Cloud Build; push to `main` (or run the trigger) to build and deploy. See [SETUP-GCP.md](SETUP-GCP.md) §6 Option C.
 - **From your machine:** `docker build -t odoo-sync-worker .` then push to Artifact Registry and deploy, or use `gcloud run deploy --source=.` (see SETUP-GCP.md §6 Option A/B).
 

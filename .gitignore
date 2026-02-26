@@ -25,6 +25,3 @@ build/
 
 # Optional: uncomment if you keep plan files local
 # .cursor/
-
-# Backed-up broken .git (do not commit)
-.git.bak/
