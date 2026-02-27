@@ -5,7 +5,9 @@
 const uidCache = new Map();
 
 function cacheKey(cfg) {
-  return `${cfg.baseUrl}|${cfg.db}|${cfg.login}`;
+  // Include password so different API keys for the same login don't share a cached uid
+  // (otherwise one project's valid key would make another project's bad key appear to work).
+  return `${cfg.baseUrl}|${cfg.db}|${cfg.login}|${cfg.password || ''}`;
 }
 
 export async function odooAuthenticate(cfg) {

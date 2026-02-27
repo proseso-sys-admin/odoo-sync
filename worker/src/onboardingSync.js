@@ -35,7 +35,20 @@ export async function runOnboardingSync(sourceCfg, routing, maxConcurrentTargets
     const permIds = attachmentIdsFromField(generalTask.x_studio_permanent_files);
     const tempIds = attachmentIdsFromField(generalTask.x_studio_temporary_files);
     const allIds = [...new Set([...permIds, ...tempIds])];
-    const onboardingFolderId = await ensureOnboardingFolder(targetCfg, companyId);
+    let onboardingFolderId;
+    try {
+      onboardingFolderId = await ensureOnboardingFolder(targetCfg, companyId);
+    } catch (e) {
+      const msg = e && e.message ? String(e.message) : String(e);
+      const isAccessDenied = /Access Denied|AccessDenied/i.test(msg);
+      const reason = isAccessDenied
+        ? 'Access Denied (user has no permission on Documents app in target DB)'
+        : /auth failed|result false/i.test(msg)
+          ? 'auth failed (wrong API key or user in target)'
+          : 'error';
+      console.warn('[onboarding] Skipping target (' + reason + '):', route.target_base_url, route.target_db, route.target_login, '—', msg.slice(0, 120));
+      return { synced: 0, deleted: 0 };
+    }
     let synced = 0;
     for (const attId of allIds) {
       try {

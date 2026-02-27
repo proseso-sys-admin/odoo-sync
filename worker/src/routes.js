@@ -89,8 +89,7 @@ export async function loadRoutesFromOdoo(sourceCfg) {
       continue;
     }
     if (!email || !apiKey) {
-      console.log('[routes] project', pid, '→ missing email or api key');
-      continue;
+      continue; // ignore: no API key / email configured
     }
 
     // Support both x_studio_multi_company and x_studio_multicompany; when false or missing → default to company 1

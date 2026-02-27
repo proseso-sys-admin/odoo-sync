@@ -47,15 +47,54 @@ export async function upsertMoveDocumentForAttachment(targetCfg, companyId, atta
     );
     return { action: 'moved', doc_id: docId };
   }
-  const createdDocId = await odooExecuteKw(
-    targetCfg,
-    'documents.document',
-    'create',
-    [[{ name: String(docName || 'Document'), folder_id: folderId, attachment_id: attId, company_id: companyId, owner_id: false }]],
-    kwWithCompany(companyId)
-  );
-  const docId = requireId(createdDocId, { where: 'doc create', attId });
-  return { action: 'created', doc_id: docId };
+  try {
+    const createdDocId = await odooExecuteKw(
+      targetCfg,
+      'documents.document',
+      'create',
+      [[{ name: String(docName || 'Document'), folder_id: folderId, attachment_id: attId, company_id: companyId, owner_id: false }]],
+      kwWithCompany(companyId)
+    );
+    const docId = requireId(createdDocId, { where: 'doc create', attId });
+    return { action: 'created', doc_id: docId };
+  } catch (createErr) {
+    const msg = String(createErr && createErr.message ? createErr.message : createErr);
+    const isAlreadyDocument =
+      /already a document/i.test(msg) ||
+      /documents_document_attachment_unique|UniqueViolation/i.test(msg);
+    if (!isAlreadyDocument) throw createErr;
+    // Attachment already has a document (e.g. search missed it due to company or race). Find and move.
+    let retryDocIds =
+      (await odooExecuteKw(
+        targetCfg,
+        'documents.document',
+        'search',
+        [[['attachment_id', '=', attId]]],
+        { limit: 5 }
+      )) || [];
+    if (!retryDocIds.length) {
+      retryDocIds =
+        (await odooExecuteKw(
+          targetCfg,
+          'documents.document',
+          'search',
+          [[['attachment_id', '=', attId]]],
+          kwWithCompany(companyId, { limit: 5 })
+        )) || [];
+    }
+    if (retryDocIds.length) {
+      const docId = requireId(retryDocIds[0], { where: 'doc existing after create conflict', attId });
+      await odooExecuteKw(
+        targetCfg,
+        'documents.document',
+        'write',
+        [[docId], { folder_id: folderId, name: String(docName || 'Document'), company_id: companyId, owner_id: false }],
+        kwWithCompany(companyId)
+      );
+      return { action: 'moved', doc_id: docId };
+    }
+    throw createErr;
+  }
 }
 
 export async function deleteTargetDocAndAttachment(targetCfg, companyId, targetAttachmentId) {

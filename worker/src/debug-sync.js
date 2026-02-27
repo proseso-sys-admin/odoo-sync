@@ -7,7 +7,7 @@
 import { getSourceConfig } from './config.js';
 import { loadRoutesFromOdoo } from './routes.js';
 import { runFullSync } from './runSync.js';
-import { routeKey } from './odoo.js';
+import { routeKey, odooAuthenticate } from './odoo.js';
 
 async function main() {
   process.env.ODOO_SYNC_DEBUG = '1';
@@ -32,6 +32,38 @@ async function main() {
   const hdfKey = routeList.find((r) => r.target.includes('hdf-energy'))?.key;
   if (hdfKey) console.log('\n  (hdf-energy target key:', hdfKey + ')');
   else console.log('\n  (No route for hdf-energy-holdings-incorporated in the list above)');
+
+  console.log('\n--- Checking target credentials ---\n');
+  const badTargets = [];
+  for (const [spid, route] of routing.entries()) {
+    const targetCfg = {
+      baseUrl: route.target_base_url,
+      db: route.target_db,
+      login: route.target_login,
+      password: route.target_password,
+    };
+    try {
+      await odooAuthenticate(targetCfg);
+      console.log(`  OK   Project ${spid} → ${route.target_base_url} (${route.target_db})`);
+    } catch (e) {
+      const msg = e && e.message;
+      badTargets.push({
+        projectId: spid,
+        url: route.target_base_url,
+        db: route.target_db,
+        login: route.target_login,
+        message: msg,
+      });
+      console.log(`  FAIL Project ${spid} → ${route.target_base_url} (${route.target_db}) login=${route.target_login}`);
+      console.log(`       ${msg}`);
+    }
+  }
+  if (badTargets.length) {
+    console.log('\n--- Bad credentials (these targets will be skipped during sync) ---');
+    badTargets.forEach((t) =>
+      console.log(`  Project ${t.projectId}: ${t.url} | db=${t.db} | login=${t.login}`)
+    );
+  }
 
   console.log('\n--- Running full sync ---\n');
   const result = await runFullSync();
