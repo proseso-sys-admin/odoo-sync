@@ -59,11 +59,18 @@ export async function upsertMoveDocumentForAttachment(targetCfg, companyId, atta
     return { action: 'created', doc_id: docId };
   } catch (createErr) {
     const msg = String(createErr && createErr.message ? createErr.message : createErr);
+    const isMissing =
+      /MissingError/i.test(msg) ||
+      /does not exist or has been deleted/i.test(msg);
+    if (isMissing) {
+      const err = new Error('ATTACHMENT_DELETED: target attachment ' + attId + ' was deleted before document could be created');
+      err.code = 'ATTACHMENT_DELETED';
+      throw err;
+    }
     const isAlreadyDocument =
       /already a document/i.test(msg) ||
       /documents_document_attachment_unique|UniqueViolation/i.test(msg);
     if (!isAlreadyDocument) throw createErr;
-    // Attachment already has a document (e.g. search missed it due to company or race). Find and move.
     let retryDocIds =
       (await odooExecuteKw(
         targetCfg,
@@ -93,8 +100,7 @@ export async function upsertMoveDocumentForAttachment(targetCfg, companyId, atta
       );
       return { action: 'moved', doc_id: docId };
     }
-    console.warn('[docs] Document exists for attachment', attId, 'but search cannot find it (access rules / company filter). Treating as handled.');
-    return { action: 'exists_not_visible', doc_id: null };
+    throw createErr;
   }
 }
 

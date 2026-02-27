@@ -518,20 +518,37 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
   let existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
   let targetAttachmentId;
   const isExisting = existingAttIds.length > 0;
+
+  const createTargetAtt = async () => {
+    const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[a.id], ['datas']], {}) || [];
+    const datas = srcBin[0] && srcBin[0].datas ? srcBin[0].datas : null;
+    if (!datas) return null;
+    const id = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
+    return requireId(id, { where: 'created target attachment' });
+  };
+
   if (isExisting) {
     targetAttachmentId = requireId(existingAttIds[0], { where: 'existing target attachment' });
   } else {
-    const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[a.id], ['datas']], {}) || [];
-    const datas = srcBin[0] && srcBin[0].datas ? srcBin[0].datas : null;
-    if (!datas) return { ok: false, error: 'Missing datas from source attachment', attachment_id: attId };
-    targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker, res_model: 'documents.document' }]], {});
-    targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
+    targetAttachmentId = await createTargetAtt();
+    if (!targetAttachmentId) return { ok: false, error: 'Missing datas from source attachment', attachment_id: attId };
   }
 
   const destFolderId = bucket
     ? await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName)
     : await ensureTaxPathFolder(targetCfg, companyId, parsed.year, parsed.monthName);
-  await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+  try {
+    await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+  } catch (upsertErr) {
+    if (upsertErr && upsertErr.code === 'ATTACHMENT_DELETED') {
+      console.warn('[single-att] Attachment', targetAttachmentId, 'was deleted, recreating for source att', attId);
+      targetAttachmentId = await createTargetAtt();
+      if (!targetAttachmentId) return { ok: false, error: 'Missing datas on retry', attachment_id: attId };
+      await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+    } else {
+      throw upsertErr;
+    }
+  }
 
   const destPath = bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`;
   console.log('[single-att] DONE att=', attId, 'target_att=', targetAttachmentId, isExisting ? '(moved)' : '(created)', 'dest=', destPath);
@@ -662,17 +679,34 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
       const existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
       let targetAttachmentId;
       const isExisting = existingAttIds.length > 0;
+
+      const createTargetAtt = async () => {
+        const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[srcAttId], ['datas']], {}) || [];
+        const datas = srcBin[0]?.datas;
+        if (!datas) return null;
+        const id = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
+        return requireId(id, { where: 'created target attachment' });
+      };
+
       if (isExisting) {
         targetAttachmentId = requireId(existingAttIds[0], { where: 'existing target attachment' });
       } else {
-        const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[srcAttId], ['datas']], {}) || [];
-        const datas = srcBin[0]?.datas;
-        if (!datas) { results.push({ id: srcAttId, status: 'skip_no_data' }); return; }
-        targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker, res_model: 'documents.document' }]], {});
-        targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
+        targetAttachmentId = await createTargetAtt();
+        if (!targetAttachmentId) { results.push({ id: srcAttId, status: 'skip_no_data' }); return; }
       }
       const destFolderId = await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName);
-      await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+      try {
+        await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+      } catch (upsertErr) {
+        if (upsertErr && upsertErr.code === 'ATTACHMENT_DELETED') {
+          console.warn('[batch-tax] Attachment', targetAttachmentId, 'was deleted, recreating for source att', srcAttId);
+          targetAttachmentId = await createTargetAtt();
+          if (!targetAttachmentId) { results.push({ id: srcAttId, status: 'skip_no_data_retry' }); return; }
+          await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+        } else {
+          throw upsertErr;
+        }
+      }
       synced++;
       results.push({ id: srcAttId, name: a.name, bucket, status: isExisting ? 'moved' : 'created' });
     } catch (e) {

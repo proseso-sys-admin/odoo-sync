@@ -56,21 +56,31 @@ export async function runOnboardingSync(sourceCfg, routing, maxConcurrentTargets
         const attRows = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[attId], ['id', 'name', 'mimetype', 'datas']], {}) || [];
         const att = attRows[0];
         if (!att || !att.datas) continue;
-        let existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
-        let targetAttachmentId;
-        if (existingAttIds.length) {
-          targetAttachmentId = requireId(existingAttIds[0], { where: 'onboarding existing' });
-        } else {
-          targetAttachmentId = await odooExecuteKw(
-            targetCfg,
-            'ir.attachment',
-            'create',
-            [[{ name: att.name, mimetype: att.mimetype || 'application/octet-stream', datas: att.datas, type: 'binary', description: marker, res_model: 'documents.document' }]],
-            {}
+
+        const createAtt = async () => {
+          const id = await odooExecuteKw(
+            targetCfg, 'ir.attachment', 'create',
+            [[{ name: att.name, mimetype: att.mimetype || 'application/octet-stream', datas: att.datas, type: 'binary', description: marker }]], {}
           );
-          targetAttachmentId = requireId(targetAttachmentId, { where: 'onboarding created' });
+          return requireId(id, { where: 'onboarding created' });
+        };
+
+        let existingAttIds = await odooExecuteKw(targetCfg, 'ir.attachment', 'search', [[['description', '=', marker]]], { limit: 1 }) || [];
+        let targetAttachmentId = existingAttIds.length
+          ? requireId(existingAttIds[0], { where: 'onboarding existing' })
+          : await createAtt();
+
+        try {
+          await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, onboardingFolderId, att.name);
+        } catch (upsertErr) {
+          if (upsertErr && upsertErr.code === 'ATTACHMENT_DELETED') {
+            console.warn('[onboarding] Attachment', targetAttachmentId, 'was deleted, recreating for source att', attId);
+            targetAttachmentId = await createAtt();
+            await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, onboardingFolderId, att.name);
+          } else {
+            throw upsertErr;
+          }
         }
-        await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, onboardingFolderId, att.name);
         synced++;
       } catch (e) {
         console.warn('Onboarding sync att failed', attId, e && e.message);
