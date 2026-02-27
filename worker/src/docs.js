@@ -93,7 +93,8 @@ export async function upsertMoveDocumentForAttachment(targetCfg, companyId, atta
       );
       return { action: 'moved', doc_id: docId };
     }
-    throw createErr;
+    console.warn('[docs] Document exists for attachment', attId, 'but search cannot find it (access rules / company filter). Treating as handled.');
+    return { action: 'exists_not_visible', doc_id: null };
   }
 }
 
