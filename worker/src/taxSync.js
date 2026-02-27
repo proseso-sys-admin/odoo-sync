@@ -524,7 +524,7 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
     const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[a.id], ['datas']], {}) || [];
     const datas = srcBin[0] && srcBin[0].datas ? srcBin[0].datas : null;
     if (!datas) return { ok: false, error: 'Missing datas from source attachment', attachment_id: attId };
-    targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
+    targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker, res_model: 'documents.document' }]], {});
     targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
   }
 
@@ -668,7 +668,7 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
         const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[srcAttId], ['datas']], {}) || [];
         const datas = srcBin[0]?.datas;
         if (!datas) { results.push({ id: srcAttId, status: 'skip_no_data' }); return; }
-        targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
+        targetAttachmentId = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker, res_model: 'documents.document' }]], {});
         targetAttachmentId = requireId(targetAttachmentId, { where: 'created target attachment' });
       }
       const destFolderId = await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName);

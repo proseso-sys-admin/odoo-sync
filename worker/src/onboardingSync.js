@@ -65,7 +65,7 @@ export async function runOnboardingSync(sourceCfg, routing, maxConcurrentTargets
             targetCfg,
             'ir.attachment',
             'create',
-            [[{ name: att.name, mimetype: att.mimetype || 'application/octet-stream', datas: att.datas, type: 'binary', description: marker }]],
+            [[{ name: att.name, mimetype: att.mimetype || 'application/octet-stream', datas: att.datas, type: 'binary', description: marker, res_model: 'documents.document' }]],
             {}
           );
           targetAttachmentId = requireId(targetAttachmentId, { where: 'onboarding created' });
