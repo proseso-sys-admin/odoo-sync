@@ -197,10 +197,20 @@ export function parseTaxAndPeriodFromTaskName(taskName) {
   const bracketVal = bracket ? String(bracket[1]).trim() : '';
   const monthNameFromMM = (mm) => MONTH_NAMES[String(mm).padStart(2, '0')] || String(mm);
 
+  // Check for [YYYY.MM]
   let m = bracketVal.match(/\b(20\d{2})\.(0[1-9]|1[0-2])\b/);
   if (m) return { year: m[1], monthName: monthNameFromMM(m[2]) };
+
+  // Check for [YYYY]
   m = bracketVal.match(/\b(20\d{2})\b/);
-  if (m) return { year: m[1], monthName: null };
+  if (m) {
+    // If we only have year, look for Q1, Q2, Q3, Q4 in the task name
+    const qMatch = raw.match(/\b(Q[1-4])\b/i);
+    if (qMatch) {
+      return { year: m[1], monthName: qMatch[1].toUpperCase() };
+    }
+    return { year: m[1], monthName: null };
+  }
   return { year: null, monthName: null };
 }
 
