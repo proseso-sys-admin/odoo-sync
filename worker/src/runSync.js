@@ -7,7 +7,7 @@
 import { getSourceConfig } from './config.js';
 import { loadRoutesFromOdoo } from './routes.js';
 import { runTaxSync, syncSingleAttachment, deleteSingleAttachment, syncTaskAttachments } from './taxSync.js';
-import { runOnboardingSync } from './onboardingSync.js';
+import { runOnboardingSync, syncSingleOnboardingAttachment, syncTaskOnboardingAttachments } from './onboardingSync.js';
 import { MAX_CONCURRENT_TARGETS } from './config.js';
 import { routeKey } from './odoo.js';
 
@@ -61,14 +61,27 @@ export async function runFullSync(opts = {}) {
 
 /**
  * Sync a single attachment immediately (bypass cursor).
- * @param {number|string} attachmentId - Source attachment ID
- * @returns {Promise<object>}
+ * Tries tax sync first, then onboarding. If source is gone, auto-deletes from targets.
  */
 export async function runSingleAttachmentSync(attachmentId) {
   const sourceCfg = getSourceConfig();
   const routing = await loadRoutesFromOdoo(sourceCfg);
   if (!routing.size) return { ok: false, error: 'no_routes' };
-  return syncSingleAttachment(sourceCfg, routing, attachmentId);
+
+  const taxResult = await syncSingleAttachment(sourceCfg, routing, attachmentId);
+  if (taxResult.ok) return taxResult;
+
+  const onboardingResult = await syncSingleOnboardingAttachment(sourceCfg, routing, attachmentId);
+  if (onboardingResult.ok) return onboardingResult;
+
+  const sourceGone =
+    taxResult.error === 'Attachment not found in source' ||
+    onboardingResult.error === 'attachment_not_found';
+  if (sourceGone) {
+    console.log('[single-att] source attachment', attachmentId, 'gone — deleting from targets');
+    return deleteSingleAttachment(sourceCfg, routing, attachmentId);
+  }
+  return taxResult;
 }
 
 /**
@@ -85,12 +98,18 @@ export async function runDeleteAttachmentSync(attachmentId) {
 
 /**
  * Sync all attachments for a task (triggered by project.task write webhook).
- * @param {number|string} taskId - Source task ID
- * @returns {Promise<object>}
+ * Tries tax sync first; if the task isn't a tax/gvt task, falls back to onboarding.
  */
 export async function runTaskAttachmentsSync(taskId) {
   const sourceCfg = getSourceConfig();
   const routing = await loadRoutesFromOdoo(sourceCfg);
   if (!routing.size) return { ok: false, error: 'no_routes' };
-  return syncTaskAttachments(sourceCfg, routing, taskId);
+
+  const taxResult = await syncTaskAttachments(sourceCfg, routing, taskId);
+  if (taxResult.ok) return taxResult;
+
+  const onboardingResult = await syncTaskOnboardingAttachments(sourceCfg, routing, taskId);
+  if (onboardingResult.ok) return onboardingResult;
+
+  return taxResult;
 }
