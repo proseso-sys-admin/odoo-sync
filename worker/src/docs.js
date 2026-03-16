@@ -67,6 +67,13 @@ export async function upsertMoveDocumentForAttachment(targetCfg, companyId, atta
       err.code = 'ATTACHMENT_DELETED';
       throw err;
     }
+    const isArchivedFolder = /archived folder/i.test(msg);
+    if (isArchivedFolder) {
+      const err = new Error('FOLDER_ARCHIVED: cannot create document in archived folder ' + folderId);
+      err.code = 'FOLDER_ARCHIVED';
+      err.folderId = folderId;
+      throw err;
+    }
     const isAlreadyDocument =
       /already a document/i.test(msg) ||
       /documents_document_attachment_unique|UniqueViolation/i.test(msg);

@@ -128,3 +128,10 @@ export async function ensureBucketTaxPathFolder(targetCfg, companyId, bucketName
 export async function ensureOnboardingFolder(targetCfg, companyId) {
   return findOrCreateFolder(targetCfg, companyId, 'Onboarding', false);
 }
+
+/** Remove any cache entry that resolves to the given folder ID (call after an archived-folder error). */
+export function evictFolderById(folderId) {
+  for (const [key, val] of _folderCache) {
+    if (val === folderId) _folderCache.delete(key);
+  }
+}
