@@ -6,6 +6,7 @@
 
 import { odooExecuteKw, requireId, buildMarker, parseSrcAttIdFromMarker, isQualifyingTaxTaskName, isQualifyingGvtContribsTaskName, targetKey, parseTaxAndPeriodFromTaskName } from './odoo.js';
 import { getLastAttachmentId, setLastAttachmentId, getGcCursor, setGcCursor } from './state.js';
+import { buildTaxDocName } from './naming.js';
 import { getTaxBucketFromResField, getGvtContribBucketFromResField, ensureTaxPathFolder, ensureBucketTaxPathFolder, TAX_BUCKET_FIELDS, FIELD_TO_TAX_BUCKET, GVT_CONTRIB_BUCKET_FIELDS, FIELD_TO_GVT_CONTRIB_BUCKET } from './folders.js';
 import { upsertMoveDocumentForAttachment, deleteTargetDocAndAttachment } from './docs.js';
 import { ATTACHMENT_BATCH_LIMIT } from './config.js';
@@ -14,6 +15,30 @@ const ALLOWED_STAGE_NAME = 'APPROVED / DONE';
 const DEBUG = process.env.ODOO_SYNC_DEBUG === '1' || process.env.ODOO_SYNC_DEBUG === 'true';
 function debugTax(...args) {
   if (DEBUG) console.warn('[tax-debug]', ...args);
+}
+
+/**
+ * Post an internal note on the source task after a successful sync.
+ * Failures are swallowed so they never abort the sync.
+ */
+async function postSyncNote(sourceCfg, taskId, docName, targetBaseUrl, bucket, parsed) {
+  try {
+    const parts = ['Taxes and Statutories'];
+    if (parsed.year) parts.push(String(parsed.year));
+    if (bucket) parts.push(String(bucket));
+    if (parsed.monthName) parts.push(String(parsed.monthName));
+    const location = parts.join(' / ');
+    const body = `<p>Synced to ${targetBaseUrl}</p><p>File: ${docName}</p><p>Location: ${location}</p>`;
+    await odooExecuteKw(
+      sourceCfg,
+      'project.task',
+      'message_post',
+      [[taskId]],
+      { body, message_type: 'comment', subtype_xmlid: 'mail.mt_note' }
+    );
+  } catch (e) {
+    console.warn('[tax] postSyncNote failed for task', taskId, ':', String(e?.message || e));
+  }
 }
 
 /**
@@ -267,7 +292,9 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
           ? await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName)
           : await ensureTaxPathFolder(targetCfg, companyId, parsed.year, parsed.monthName);
         if (DEBUG) debugTax('dest folder att=', a.id, 'bucket=', bucket || '(no bucket)', 'path=', bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`);
-        await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+        const docName = buildTaxDocName(a.name, bucket, parsed);
+        await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, docName);
+        await postSyncNote(sourceCfg, Number(a.res_id), docName, route.target_base_url, bucket, parsed);
         metrics.nProcessed++;
         metrics.nCreatedOrMoved++;
       } catch (e) {
@@ -537,18 +564,20 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
   const destFolderId = bucket
     ? await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName)
     : await ensureTaxPathFolder(targetCfg, companyId, parsed.year, parsed.monthName);
+  const docName = buildTaxDocName(a.name, bucket, parsed);
   try {
-    await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+    await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, docName);
   } catch (upsertErr) {
     if (upsertErr && upsertErr.code === 'ATTACHMENT_DELETED') {
       console.warn('[single-att] Attachment', targetAttachmentId, 'was deleted, recreating for source att', attId);
       targetAttachmentId = await createTargetAtt();
       if (!targetAttachmentId) return { ok: false, error: 'Missing datas on retry', attachment_id: attId };
-      await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+      await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, docName);
     } else {
       throw upsertErr;
     }
   }
+  await postSyncNote(sourceCfg, Number(a.res_id), docName, route.target_base_url, bucket, parsed);
 
   const destPath = bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`;
   console.log('[single-att] DONE att=', attId, 'target_att=', targetAttachmentId, isExisting ? '(moved)' : '(created)', 'dest=', destPath);
@@ -695,18 +724,20 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
         if (!targetAttachmentId) { results.push({ id: srcAttId, status: 'skip_no_data' }); return; }
       }
       const destFolderId = await ensureBucketTaxPathFolder(targetCfg, companyId, bucket, parsed.year, parsed.monthName);
+      const docName = buildTaxDocName(a.name, bucket, parsed);
       try {
-        await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+        await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, docName);
       } catch (upsertErr) {
         if (upsertErr && upsertErr.code === 'ATTACHMENT_DELETED') {
           console.warn('[batch-tax] Attachment', targetAttachmentId, 'was deleted, recreating for source att', srcAttId);
           targetAttachmentId = await createTargetAtt();
           if (!targetAttachmentId) { results.push({ id: srcAttId, status: 'skip_no_data_retry' }); return; }
-          await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, a.name);
+          await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, docName);
         } else {
           throw upsertErr;
         }
       }
+      await postSyncNote(sourceCfg, tid, docName, route.target_base_url, bucket, parsed);
       synced++;
       results.push({ id: srcAttId, name: a.name, bucket, status: isExisting ? 'moved' : 'created' });
     } catch (e) {
