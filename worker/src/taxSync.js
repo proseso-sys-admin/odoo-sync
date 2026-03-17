@@ -72,7 +72,7 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
   let maxSeenId = lastId;
 
   if (!attIds.length) {
-    const gcResult = await runTaxGcForAllTargets(routingObj, allowedProjectsByTarget, sourceCfg);
+    const gcResult = await runTaxGcForAllTargets(routingObj, allowedProjectsByTarget, sourceCfg, maxConcurrentTargets);
     return { metrics, gc: gcResult };
   }
 
@@ -321,6 +321,7 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
   }
 
   await setLastAttachmentId(maxSeenId);
+  console.log('[tax] sync done nAttIds=', metrics.nAttIds, 'nCreatedOrMoved=', metrics.nCreatedOrMoved, 'nSkipStage=', metrics.nSkipStage, 'nSkipNotTaxOrGvt=', metrics.nSkipNotTaxOrGvt, 'failures=', (failures || []).length, 'gc.deleted=', gcDeleted);
   return { metrics, gc: { scanned: gcScanned, deleted: gcDeleted }, failures };
 }
 
@@ -414,8 +415,8 @@ async function syncDeletionsForTarget(sourceCfg, targetCfg, companyId, allowedSo
   return { scanned: rows.length, deleted };
 }
 
-async function runTaxGcForAllTargets(routingObj, allowedProjectsByTarget, sourceCfg) {
-  const targets = [];
+async function runTaxGcForAllTargets(routingObj, allowedProjectsByTarget, sourceCfg, maxConcurrent = 10) {
+  const targetList = [];
   const seen = new Set();
   for (const [spid, route] of Object.entries(routingObj)) {
     const k = [route.target_base_url, route.target_db, route.target_login, String(route.target_company_id)].join('|');
@@ -424,10 +425,18 @@ async function runTaxGcForAllTargets(routingObj, allowedProjectsByTarget, source
     const targetCfg = { baseUrl: route.target_base_url, db: route.target_db, login: route.target_login, password: route.target_password };
     const companyId = requireId(route.target_company_id, { where: 'route.target_company_id', source_project_id: spid });
     const allowed = allowedProjectsByTarget.get(k) || [];
-    targets.push(syncDeletionsForTarget(sourceCfg, targetCfg, companyId, allowed));
+    targetList.push({ targetCfg, companyId, allowed });
   }
-  const results = await Promise.all(targets);
-  return { scanned: results.reduce((s, r) => s + r.scanned, 0), deleted: results.reduce((s, r) => s + r.deleted, 0) };
+  let scanned = 0;
+  let deleted = 0;
+  for (let i = 0; i < targetList.length; i += maxConcurrent) {
+    const chunk = targetList.slice(i, i + maxConcurrent);
+    const results = await Promise.all(chunk.map(({ targetCfg, companyId, allowed }) =>
+      syncDeletionsForTarget(sourceCfg, targetCfg, companyId, allowed)
+    ));
+    for (const r of results) { scanned += r.scanned; deleted += r.deleted; }
+  }
+  return { scanned, deleted };
 }
 
 /**
