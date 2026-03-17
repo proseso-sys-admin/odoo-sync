@@ -29,20 +29,26 @@ async function assertFolderDoc(targetCfg, companyId, docId, ctx = {}) {
 export async function upsertMoveDocumentForAttachment(targetCfg, companyId, attachmentId, destFolderId, docName) {
   const attId = requireId(attachmentId, { where: 'upsertMoveDocumentForAttachment' });
   const folderId = await assertFolderDoc(targetCfg, companyId, destFolderId, { attId });
-  const docIds = await odooExecuteKw(
+  const docRows = await odooExecuteKw(
     targetCfg,
     'documents.document',
-    'search',
-    [[['attachment_id', '=', attId]]],
+    'search_read',
+    [[['attachment_id', '=', attId]], ['id', 'folder_id', 'name']],
     kwWithCompany(companyId, { limit: 5 })
   );
-  if (docIds && docIds.length) {
-    const docId = requireId(docIds[0], { where: 'doc existing', attId });
+  if (docRows && docRows.length) {
+    const doc = docRows[0];
+    const docId = requireId(doc.id, { where: 'doc existing', attId });
+    const curFolderId = Array.isArray(doc.folder_id) ? doc.folder_id[0] : doc.folder_id;
+    const desiredName = String(docName || 'Document');
+    if (curFolderId === folderId && String(doc.name || '') === desiredName) {
+      return { action: 'unchanged', doc_id: docId };
+    }
     await odooExecuteKw(
       targetCfg,
       'documents.document',
       'write',
-      [[docId], { folder_id: folderId, name: String(docName || 'Document'), company_id: companyId, owner_id: false }],
+      [[docId], { folder_id: folderId, name: desiredName, company_id: companyId, owner_id: false }],
       kwWithCompany(companyId)
     );
     return { action: 'moved', doc_id: docId };
@@ -98,13 +104,19 @@ export async function upsertMoveDocumentForAttachment(targetCfg, companyId, atta
     }
     if (retryDocIds.length) {
       const docId = requireId(retryDocIds[0], { where: 'doc existing after create conflict', attId });
-      await odooExecuteKw(
-        targetCfg,
-        'documents.document',
-        'write',
-        [[docId], { folder_id: folderId, name: String(docName || 'Document'), company_id: companyId, owner_id: false }],
-        kwWithCompany(companyId)
-      );
+      const desiredName = String(docName || 'Document');
+      const retryRows = await odooExecuteKw(targetCfg, 'documents.document', 'read', [[docId], ['folder_id', 'name']], kwWithCompany(companyId)) || [];
+      const cur = retryRows[0];
+      const curFolderId = cur && (Array.isArray(cur.folder_id) ? cur.folder_id[0] : cur.folder_id);
+      if (curFolderId !== folderId || (cur && String(cur.name || '') !== desiredName)) {
+        await odooExecuteKw(
+          targetCfg,
+          'documents.document',
+          'write',
+          [[docId], { folder_id: folderId, name: desiredName, company_id: companyId, owner_id: false }],
+          kwWithCompany(companyId)
+        );
+      }
       return { action: 'moved', doc_id: docId };
     }
     throw createErr;

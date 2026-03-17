@@ -8,6 +8,11 @@ import { odooExecuteKw, parseAcctDb, isFalsyOdooValue } from './odoo.js';
 const ROUTING_STAGE_NAME = 'Master';
 const GENERAL_TASK_NAME = 'General';
 
+/** Routes are project-level config that changes rarely; cache for 60 s. */
+const ROUTE_CACHE_TTL_MS = 60_000;
+let _routeCache = null; // { routing: Map, loadedAt: number }
+let _routeLoadInFlight = null; // pending Promise<Map> — coalesces concurrent loads
+
 // Only request fields that exist on source DB (x_studio_multicompany may not exist; we fall back to x_studio_multi_company in code)
 const GENERAL_TASK_FIELDS = [
   'id',
@@ -29,6 +34,36 @@ const GENERAL_TASK_FIELDS = [
  *   route: { target_base_url, target_db, target_login, target_password, target_company_id, generalTaskId }
  */
 export async function loadRoutesFromOdoo(sourceCfg) {
+  const now = Date.now();
+
+  // Fast path: fresh cache
+  if (_routeCache && (now - _routeCache.loadedAt) < ROUTE_CACHE_TTL_MS) {
+    return _routeCache.routing;
+  }
+
+  // Coalesce concurrent loads: if a load is already in flight, wait for it
+  if (_routeLoadInFlight) return _routeLoadInFlight;
+
+  _routeLoadInFlight = _loadRoutesFromOdoo(sourceCfg)
+    .then((routing) => {
+      _routeCache = { routing, loadedAt: Date.now() };
+      _routeLoadInFlight = null;
+      return routing;
+    })
+    .catch((err) => {
+      _routeLoadInFlight = null;
+      // Serve stale cache rather than failing — transient 429s shouldn't break syncs
+      if (_routeCache) {
+        console.warn('[routes] Reload failed, serving stale cache (age', Math.round((Date.now() - _routeCache.loadedAt) / 1000), 's):', String(err?.message || err));
+        return _routeCache.routing;
+      }
+      throw err;
+    });
+
+  return _routeLoadInFlight;
+}
+
+async function _loadRoutesFromOdoo(sourceCfg) {
   // 1) Projects that have at least one Tax PH task in stage "Master"
   const taxTasks = await odooExecuteKw(
     sourceCfg,

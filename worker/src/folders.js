@@ -45,7 +45,7 @@ export async function findOrCreateFolder(targetCfg, companyId, name, parentFolde
       'documents.document',
       'search',
       [[['name', '=', String(name)], ['type', '=', 'folder'], ['folder_id', '=', parentId]]],
-      kwWithCompany(companyId, { limit: 1 })
+      kwWithCompany(companyId, { limit: 1, order: 'id asc' })
     );
     if (ids && ids.length) {
       const id = requireId(ids[0], { where: 'folder existing', name, parentId });
