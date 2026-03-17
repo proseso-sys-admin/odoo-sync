@@ -28,7 +28,7 @@ async function postSyncNote(sourceCfg, taskId, docName, targetBaseUrl, bucket, p
     if (bucket) parts.push(String(bucket));
     if (parsed.monthName) parts.push(String(parsed.monthName));
     const location = parts.join(' / ');
-    const body = `<p>Synced to ${targetBaseUrl}</p><p>File: ${docName}</p><p>Location: ${location}</p>`;
+    const body = `Synced to ${targetBaseUrl}\n\nFile: ${docName}\nLocation: ${location}`;
     await odooExecuteKw(
       sourceCfg,
       'project.task',
