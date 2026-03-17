@@ -302,8 +302,12 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
       }
     }
     const allowed = allowedProjectsByTarget.get(key) || [];
-    const res = await syncDeletionsForTarget(sourceCfg, targetCfg, companyId, allowed);
-    return res;
+    try {
+      return await syncDeletionsForTarget(sourceCfg, targetCfg, companyId, allowed);
+    } catch (gcErr) {
+      console.warn('[tax] GC skipped for target', key, '(will retry next run):', String(gcErr?.message || gcErr));
+      return { scanned: 0, deleted: 0 };
+    }
   };
 
   const chunks = [];

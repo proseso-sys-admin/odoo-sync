@@ -32,7 +32,7 @@ export function getSourceConfig() {
 }
 
 export const ATTACHMENT_BATCH_LIMIT = Math.max(1, parseInt(getEnv('ATTACHMENT_BATCH_LIMIT', '200'), 10) || 200);
-export const MAX_CONCURRENT_TARGETS = Math.max(1, parseInt(getEnv('MAX_CONCURRENT_TARGETS', '10'), 10) || 10);
+export const MAX_CONCURRENT_TARGETS = Math.max(1, parseInt(getEnv('MAX_CONCURRENT_TARGETS', '5'), 10) || 5);
 
 /** Cloud Storage: bucket name (no gs://) and object path for state JSON */
 export const STATE_GCS_BUCKET = getEnv('STATE_GCS_BUCKET', '');
