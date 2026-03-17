@@ -723,8 +723,20 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
       const isExisting = existingAttIds.length > 0;
 
       const createTargetAtt = async () => {
-        const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[srcAttId], ['datas']], {}) || [];
-        const datas = srcBin[0]?.datas;
+        // Retry reading datas: Odoo may not have committed the binary yet when the task-write
+        // webhook fires (especially for freshly uploaded attachments).
+        const DATAS_RETRY_DELAYS = [2000, 3000];
+        let datas = null;
+        for (let attempt = 0; attempt <= DATAS_RETRY_DELAYS.length; attempt++) {
+          if (attempt > 0) {
+            const delay = DATAS_RETRY_DELAYS[attempt - 1];
+            console.log(`[task-sync] datas not ready for src att ${srcAttId}, retry ${attempt}/${DATAS_RETRY_DELAYS.length} after ${delay}ms...`);
+            await new Promise((r) => setTimeout(r, delay));
+          }
+          const srcBin = await odooExecuteKw(sourceCfg, 'ir.attachment', 'read', [[srcAttId], ['datas']], {}) || [];
+          datas = srcBin[0]?.datas;
+          if (datas) break;
+        }
         if (!datas) return null;
         const id = await odooExecuteKw(targetCfg, 'ir.attachment', 'create', [[{ name: a.name, mimetype: a.mimetype || 'application/octet-stream', datas, type: 'binary', description: marker }]], {});
         return requireId(id, { where: 'created target attachment' });
