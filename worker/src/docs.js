@@ -20,7 +20,12 @@ async function assertFolderDoc(targetCfg, companyId, docId, ctx = {}) {
     kwWithCompany(companyId)
   );
   const d = (rows && rows[0]) || null;
-  if (!d) throw new Error('Folder doc not found: ' + JSON.stringify({ id, ctx }));
+  if (!d) {
+    const err = new Error('Folder doc not found: ' + JSON.stringify({ id, ctx }));
+    err.code = 'FOLDER_NOT_FOUND';
+    err.folderId = id;
+    throw err;
+  }
   const isFolder = String(d.type || '').toLowerCase() === 'folder';
   if (!isFolder) throw new Error('Resolved folder is not a folder: ' + JSON.stringify({ got: d, ctx }));
   return id;

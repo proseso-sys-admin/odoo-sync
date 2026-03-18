@@ -77,8 +77,9 @@ export async function runOnboardingSync(sourceCfg, routing, maxConcurrentTargets
             console.warn('[onboarding] Attachment', targetAttachmentId, 'was deleted, recreating for source att', attId);
             targetAttachmentId = await createAtt();
             await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, onboardingFolderId, att.name);
-          } else if (upsertErr && upsertErr.code === 'FOLDER_ARCHIVED') {
-            console.warn('[onboarding] Folder', onboardingFolderId, 'is archived, evicting cache and re-resolving for source att', attId);
+          } else if (upsertErr && (upsertErr.code === 'FOLDER_ARCHIVED' || upsertErr.code === 'FOLDER_NOT_FOUND')) {
+            const reason = upsertErr.code === 'FOLDER_NOT_FOUND' ? 'deleted' : 'archived';
+            console.warn('[onboarding] Folder', onboardingFolderId, 'is', reason, '— evicting cache and re-resolving for source att', attId);
             evictFolderById(onboardingFolderId);
             onboardingFolderId = await ensureOnboardingFolder(targetCfg, companyId);
             await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, onboardingFolderId, att.name);
@@ -240,8 +241,9 @@ async function syncOnboardingAttToTarget(sourceCfg, attId, attMeta, route, spid)
       console.warn('[onboarding-webhook] Attachment', targetAttachmentId, 'was deleted, recreating for source att', attId);
       targetAttachmentId = await createAtt();
       await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, onboardingFolderId, att.name);
-    } else if (upsertErr && upsertErr.code === 'FOLDER_ARCHIVED') {
-      console.warn('[onboarding-webhook] Folder', onboardingFolderId, 'is archived, evicting cache and re-resolving for source att', attId);
+    } else if (upsertErr && (upsertErr.code === 'FOLDER_ARCHIVED' || upsertErr.code === 'FOLDER_NOT_FOUND')) {
+      const reason = upsertErr.code === 'FOLDER_NOT_FOUND' ? 'deleted' : 'archived';
+      console.warn('[onboarding-webhook] Folder', onboardingFolderId, 'is', reason, '— evicting cache and re-resolving for source att', attId);
       evictFolderById(onboardingFolderId);
       onboardingFolderId = await ensureOnboardingFolder(targetCfg, companyId);
       await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, onboardingFolderId, att.name);

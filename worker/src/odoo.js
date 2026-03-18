@@ -96,22 +96,43 @@ export async function odooExecuteKw(cfg, model, method, args = [], kwargs = {}) 
     },
     id: 2,
   };
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const text = await res.text();
-  if (!text.trimStart().startsWith('{')) {
-    throw new Error(
-      `Odoo returned HTML instead of JSON (status ${res.status}). ` +
-      `Check SOURCE_BASE_URL: use root URL only, e.g. https://your-db.odoo.com (no /web or /web/login). ` +
-      `Got: ${text.slice(0, 80).replace(/\s+/g, ' ')}...`
-    );
+
+  // Retry on 429 rate-limit responses with exponential backoff
+  const RATE_LIMIT_DELAYS = [3000, 8000, 15000];
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= RATE_LIMIT_DELAYS.length; attempt++) {
+    if (attempt > 0) {
+      const delay = RATE_LIMIT_DELAYS[attempt - 1];
+      console.warn(`[odoo] 429 rate limit on ${model}.${method}, retry ${attempt}/${RATE_LIMIT_DELAYS.length} after ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+
+    if (!text.trimStart().startsWith('{')) {
+      if (res.status === 429) {
+        lastErr = new Error(`Odoo rate limit exceeded (429) for ${model}.${method}`);
+        continue; // will retry after delay
+      }
+      throw new Error(
+        `Odoo returned HTML instead of JSON (status ${res.status}). ` +
+        `Check SOURCE_BASE_URL: use root URL only, e.g. https://your-db.odoo.com (no /web or /web/login). ` +
+        `Got: ${text.slice(0, 80).replace(/\s+/g, ' ')}...`
+      );
+    }
+
+    const data = JSON.parse(text);
+    if (data.error) throw new Error(`Odoo execute_kw ${model}.${method}: ${JSON.stringify(data.error)}`);
+    return data.result;
   }
-  const data = JSON.parse(text);
-  if (data.error) throw new Error(`Odoo execute_kw ${model}.${method}: ${JSON.stringify(data.error)}`);
-  return data.result;
+
+  throw lastErr;
 }
 
 // --- Parsing / helpers (ported from Apps Script) ---
