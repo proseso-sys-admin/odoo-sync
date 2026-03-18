@@ -34,7 +34,7 @@ async function postSyncNote(sourceCfg, taskId, docName, targetBaseUrl, bucket, p
       'project.task',
       'message_post',
       [[taskId]],
-      { body, message_type: 'comment', subtype_xmlid: 'mail.mt_note' }
+      { body, message_type: 'comment', subtype_xmlid: 'mail.mt_note', body_is_html: true }
     );
   } catch (e) {
     console.warn('[tax] postSyncNote failed for task', taskId, ':', String(e?.message || e));
@@ -294,7 +294,9 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
         if (DEBUG) debugTax('dest folder att=', a.id, 'bucket=', bucket || '(no bucket)', 'path=', bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`);
         const docName = buildTaxDocName(a.name, bucket, parsed);
         await upsertMoveDocumentForAttachment(targetCfg, companyId, targetAttachmentId, destFolderId, docName);
-        await postSyncNote(sourceCfg, Number(a.res_id), docName, route.target_base_url, bucket, parsed);
+        if (!existingAttIds.length) {
+          await postSyncNote(sourceCfg, Number(a.res_id), docName, route.target_base_url, bucket, parsed);
+        }
         metrics.nProcessed++;
         metrics.nCreatedOrMoved++;
       } catch (e) {
@@ -590,7 +592,9 @@ export async function syncSingleAttachment(sourceCfg, routing, attachmentId) {
       throw upsertErr;
     }
   }
-  await postSyncNote(sourceCfg, Number(a.res_id), docName, route.target_base_url, bucket, parsed);
+  if (!isExisting) {
+    await postSyncNote(sourceCfg, Number(a.res_id), docName, route.target_base_url, bucket, parsed);
+  }
 
   const destPath = bucket ? `${parsed.year}/${bucket}/${parsed.monthName}` : `${parsed.year}/${parsed.monthName}`;
   console.log('[single-att] DONE att=', attId, 'target_att=', targetAttachmentId, isExisting ? '(moved)' : '(created)', 'dest=', destPath);
@@ -762,7 +766,9 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
           throw upsertErr;
         }
       }
-      await postSyncNote(sourceCfg, tid, docName, route.target_base_url, bucket, parsed);
+      if (!isExisting) {
+        await postSyncNote(sourceCfg, tid, docName, route.target_base_url, bucket, parsed);
+      }
       synced++;
       results.push({ id: srcAttId, name: a.name, bucket, status: isExisting ? 'moved' : 'created' });
     } catch (e) {
