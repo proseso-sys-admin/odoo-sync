@@ -327,6 +327,7 @@ export async function runTaxSync(sourceCfg, routing, maxConcurrentTargets = 10) 
   }
 
   await setLastAttachmentId(maxSeenId);
+  if (failures && failures.length) console.warn('[tax] failures:', JSON.stringify(failures.slice(0, 10)));
   console.log('[tax] sync done nAttIds=', metrics.nAttIds, 'nCreatedOrMoved=', metrics.nCreatedOrMoved, 'nSkipStage=', metrics.nSkipStage, 'nSkipNotTaxOrGvt=', metrics.nSkipNotTaxOrGvt, 'failures=', (failures || []).length, 'gc.deleted=', gcDeleted);
   return { metrics, gc: { scanned: gcScanned, deleted: gcDeleted }, failures };
 }
@@ -802,6 +803,8 @@ export async function syncTaskAttachments(sourceCfg, routing, taskId) {
   await Promise.all(deleteJobs);
   if (deleted) console.log('[task-sync] deleted', deleted, 'orphaned attachments');
 
+  const nonSuccess = results.filter((r) => r.status !== 'moved' && r.status !== 'created');
+  if (nonSuccess.length) console.warn('[task-sync] task=', tid, 'non-success results:', JSON.stringify(nonSuccess));
   console.log('[task-sync] DONE task=', tid, 'synced=', synced, 'deleted=', deleted);
   return { ok: true, task_id: tid, taskName, synced, deleted, results };
 }
