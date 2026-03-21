@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import calendar
 import io
-import json
 import logging
 import os
 import re
+import threading as _threading
 from datetime import date
 from datetime import date as date_type
 from urllib.parse import quote
@@ -26,9 +26,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from odoo_client import (
+    OdooConnection,
     connect, fetch_posted_bills, fetch_journal_entries_with_wht,
     fetch_partner_details, fetch_partners_by_ids, fetch_bill_lines_with_tax,
     fetch_tax_details, classify_purchase, get_companies, get_semaphore,
+    fetch_client_tasks,
 )
 from bir_format import clean_tin, clean_str
 from slsp_builder import build_slsp_rows, write_slsp_xlsx, write_slsp_dat
@@ -45,6 +47,10 @@ _ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 if not _ACCESS_TOKEN:
     raise RuntimeError("ACCESS_TOKEN environment variable must be set")
 
+for _var in ("SOURCE_BASE_URL", "SOURCE_DB", "SOURCE_LOGIN", "SOURCE_PASSWORD"):
+    if not os.environ.get(_var):
+        raise RuntimeError(f"{_var} environment variable must be set")
+
 
 def _check_token(token: str):
     """Return 404 for unknown tokens — avoids confirming service existence."""
@@ -53,13 +59,39 @@ def _check_token(token: str):
     return None
 
 
+_SOURCE_CONN: OdooConnection | None = None
+_CLIENTS_CACHE: list[dict] | None = None
+_CLIENTS_LOCK = _threading.Lock()
+
+
+def _get_source_conn() -> OdooConnection:
+    global _SOURCE_CONN
+    if _SOURCE_CONN is None:
+        _SOURCE_CONN = connect(
+            os.environ["SOURCE_BASE_URL"],
+            os.environ["SOURCE_DB"],
+            os.environ["SOURCE_LOGIN"],
+            os.environ["SOURCE_PASSWORD"],
+        )
+    return _SOURCE_CONN
+
+
 def _load_clients() -> list[dict]:
-    raw = os.environ.get("ODOO_CLIENTS_JSON", "[]")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.error("ODOO_CLIENTS_JSON is not valid JSON: %s", e)
-        return []
+    """Load client list from source Odoo project.task records (cached per container lifetime)."""
+    global _CLIENTS_CACHE
+    if _CLIENTS_CACHE is not None:
+        return _CLIENTS_CACHE
+    with _CLIENTS_LOCK:
+        if _CLIENTS_CACHE is not None:
+            return _CLIENTS_CACHE
+        try:
+            source = _get_source_conn()
+            clients = fetch_client_tasks(source)
+            _CLIENTS_CACHE = clients
+            return _CLIENTS_CACHE
+        except Exception:
+            log.exception("Failed to load client list from source Odoo")
+            return []
 
 
 def _default_quarter_dates() -> tuple[str, str]:

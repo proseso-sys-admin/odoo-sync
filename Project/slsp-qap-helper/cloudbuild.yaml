@@ -28,7 +28,7 @@ steps:
       - '--timeout=300'
       - '--memory=1Gi'
       - '--concurrency=15'
-      - '--set-secrets=ODOO_CLIENTS_JSON=odoo-slsp-clients-json:latest,ACCESS_TOKEN=slsp-qap-access-token:latest'
+      - '--set-secrets=SOURCE_BASE_URL=slsp-qap-source-url:latest,SOURCE_DB=slsp-qap-source-db:latest,SOURCE_LOGIN=slsp-qap-source-login:latest,SOURCE_PASSWORD=slsp-qap-source-password:latest,ACCESS_TOKEN=slsp-qap-access-token:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/slsp-qap-helper:$COMMIT_SHA'

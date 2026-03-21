@@ -180,3 +180,41 @@ def get_companies(conn: OdooConnection) -> list[dict]:
             if conn.db not in _company_cache:
                 _company_cache[conn.db] = fetch_companies(conn)
     return _company_cache[conn.db]
+
+
+def fetch_client_tasks(conn: OdooConnection) -> list[dict]:
+    """Query project.task records from source Odoo to get target client databases.
+
+    Returns list of dicts: {"name", "url", "db", "user", "api_key"}
+    Only includes tasks with x_studio_enabled=True and x_studio_odoo_bill_worker=True.
+    """
+    FIELDS = [
+        "id", "project_id",
+        "x_studio_accounting_database",
+        "x_studio_email",
+        "x_studio_api_key",
+    ]
+    domain = [
+        ["stage_id.name", "=", "General"],
+        ["x_studio_enabled", "=", True],
+        ["x_studio_odoo_bill_worker", "=", True],
+    ]
+    tasks = _execute(conn, "project.task", "search_read", [domain], {"fields": FIELDS})
+    clients = []
+    for task in tasks:
+        db_val = (task.get("x_studio_accounting_database") or "").strip()
+        email = (task.get("x_studio_email") or "").strip()
+        api_key = (task.get("x_studio_api_key") or "").strip()
+        if not db_val or not email or not api_key:
+            continue
+        if db_val.startswith("http"):
+            url = db_val.rstrip("/")
+            # extract db name from subdomain: https://my-db.odoo.com -> my-db
+            db = url.split("//")[-1].split(".")[0]
+        else:
+            db = db_val
+            url = f"https://{db}.odoo.com"
+        name_val = task.get("project_id")
+        name = name_val[1] if isinstance(name_val, list) and len(name_val) > 1 else db
+        clients.append({"name": name, "url": url, "db": db, "user": email, "api_key": api_key})
+    return clients
