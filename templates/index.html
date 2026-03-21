@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Enhanced BIR Reports</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+      background: #fafaf8; color: #1a1a1a; min-height: 100vh;
+    }
+    .header {
+      background: #293750; color: white; padding: 28px 32px 24px;
+    }
+    .header .subtitle {
+      font-size: 11px; letter-spacing: 1.5px;
+      text-transform: uppercase; opacity: 0.6; margin-bottom: 6px;
+    }
+    .header h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.3px; }
+    .header p { margin-top: 8px; font-size: 13px; opacity: 0.7; max-width: 600px; }
+    .container { max-width: 640px; margin: 32px auto; padding: 0 24px; }
+    .card {
+      background: white; border: 1px solid #e8e6e1;
+      border-radius: 8px; padding: 24px; margin-bottom: 20px;
+    }
+    label {
+      display: block; font-size: 12px; font-weight: 600; color: #555;
+      text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 6px;
+    }
+    select, input[type="date"] {
+      width: 100%; padding: 10px 12px; border: 1px solid #d0cec9;
+      border-radius: 6px; font-size: 14px; font-family: inherit;
+      background: white; margin-bottom: 16px;
+    }
+    .row { display: flex; gap: 16px; }
+    .row > div { flex: 1; }
+    .btn-group { display: flex; gap: 8px; margin-top: 8px; }
+    button {
+      flex: 1; padding: 12px 20px; border: none; border-radius: 6px;
+      font-family: inherit; font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: background 0.15s;
+    }
+    .btn-primary { background: #293750; color: white; }
+    .btn-primary:hover { background: #1e2b3d; }
+    .btn-secondary {
+      background: white; color: #293750; border: 1px solid #293750;
+    }
+    .btn-secondary:hover { background: #f0f0ee; }
+    .btn-loading { opacity: 0.7; cursor: wait; }
+    .result {
+      background: #f0f4ff; border-left: 3px solid #406EEA;
+      padding: 14px 18px; border-radius: 0 6px 6px 0;
+      font-size: 13px; display: none;
+    }
+    .result.show { display: block; }
+    .result.error { background: #fff0f0; border-left-color: #d32f2f; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="subtitle">Proseso Consulting</div>
+    <h1>Enhanced BIR Reports</h1>
+    <p>SLSP and QAP exports that include journal entries alongside vendor bills</p>
+  </div>
+  <div class="container">
+    <form id="exportForm" class="card">
+      <label>Report</label>
+      <select name="report_type">
+        <option value="slsp_purchases">SLSP — Purchases (SLP)</option>
+        <option value="slsp_sales">SLSP — Sales (SLS)</option>
+        <option value="qap">QAP — Quarterly Alphalist of Payees</option>
+      </select>
+      <label>Database</label>
+      <select name="db_name" id="dbSelect">
+        {% for client in clients %}
+        <option value="{{ client.db }}">{{ client.name }}</option>
+        {% endfor %}
+      </select>
+      <label>Company</label>
+      <select name="company_id" id="companySelect">
+        <option value="">Loading...</option>
+      </select>
+      <div class="row">
+        <div>
+          <label>Date From</label>
+          <input type="date" name="date_from" value="{{ default_date_from }}">
+        </div>
+        <div>
+          <label>Date To</label>
+          <input type="date" name="date_to" value="{{ default_date_to }}">
+        </div>
+      </div>
+      <div class="btn-group">
+        <button type="submit" name="format" value="xlsx" class="btn-primary">
+          Download XLSX
+        </button>
+        <button type="submit" name="format" value="dat" class="btn-secondary">
+          Download DAT
+        </button>
+      </div>
+    </form>
+    <div id="result" class="result"></div>
+  </div>
+  <script>
+    function clearSelect(sel) {
+      while (sel.firstChild) sel.removeChild(sel.firstChild);
+    }
+    function addOption(sel, value, label) {
+      var opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      sel.appendChild(opt);
+    }
+    async function loadCompanies(db) {
+      var sel = document.getElementById('companySelect');
+      clearSelect(sel);
+      addOption(sel, '', 'Loading...');
+      try {
+        var resp = await fetch('companies?db=' + encodeURIComponent(db));
+        var companies = await resp.json();
+        clearSelect(sel);
+        companies.forEach(function(c) {
+          addOption(sel, c.id, c.name + (c.vat ? ' (' + c.vat + ')' : ''));
+        });
+      } catch (err) {
+        clearSelect(sel);
+        addOption(sel, '', 'Failed to load companies');
+      }
+    }
+    document.getElementById('dbSelect').addEventListener('change', function() {
+      loadCompanies(this.value);
+    });
+    loadCompanies(document.getElementById('dbSelect').value);
+
+    document.getElementById('exportForm').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      var btn = e.submitter;
+      var origText = btn.textContent;
+      var resultEl = document.getElementById('result');
+      btn.textContent = 'Generating...';
+      btn.classList.add('btn-loading');
+      btn.disabled = true;
+      resultEl.className = 'result';
+      resultEl.style.display = 'none';
+
+      var formData = new FormData(this);
+      formData.set('format', btn.value);
+
+      try {
+        var resp = await fetch('export', { method: 'POST', body: formData });
+        if (!resp.ok) {
+          var err = await resp.json();
+          throw new Error(err.detail || 'Export failed');
+        }
+        var summary = resp.headers.get('X-Export-Summary') || '';
+        if (summary) {
+          resultEl.textContent = decodeURIComponent(summary);
+          resultEl.className = 'result show';
+        }
+        var blob = await resp.blob();
+        var disposition = resp.headers.get('Content-Disposition') || '';
+        var match = disposition.match(/filename="?(.+?)"?$/);
+        var filename = match ? match[1] : 'export.xlsx';
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+      } catch (err) {
+        resultEl.textContent = err.message;
+        resultEl.className = 'result show error';
+      } finally {
+        btn.textContent = origText;
+        btn.classList.remove('btn-loading');
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
