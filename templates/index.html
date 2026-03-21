@@ -7,100 +7,163 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: 'IBM Plex Sans', -apple-system, sans-serif;
-      background: #fafaf8; color: #1a1a1a; min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 14px; background: #f0ede8; color: #212529; min-height: 100vh;
     }
-    .header {
-      background: #293750; color: white; padding: 28px 32px 24px;
+
+    /* Odoo-style slim top navbar */
+    .o-navbar {
+      background: #1c1c1c; color: #ffffffcc;
+      height: 46px; display: flex; align-items: center;
+      padding: 0 16px; gap: 12px; position: sticky; top: 0; z-index: 100;
     }
-    .header .subtitle {
-      font-size: 11px; letter-spacing: 1.5px;
-      text-transform: uppercase; opacity: 0.6; margin-bottom: 6px;
+    .o-navbar-logo {
+      width: 28px; height: 28px; background: #017e84;
+      border-radius: 6px; display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 13px; color: white; flex-shrink: 0;
     }
-    .header h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.3px; }
-    .header p { margin-top: 8px; font-size: 13px; opacity: 0.7; max-width: 600px; }
-    .container { max-width: 640px; margin: 32px auto; padding: 0 24px; }
-    .card {
-      background: white; border: 1px solid #e8e6e1;
-      border-radius: 8px; padding: 24px; margin-bottom: 20px;
+    .o-navbar-app { font-size: 13px; font-weight: 500; color: white; }
+    .o-navbar-sep { opacity: 0.3; margin: 0 2px; }
+
+    /* Odoo-style control panel */
+    .o-control-panel {
+      background: white; border-bottom: 1px solid #dee2e6;
+      padding: 0 24px; display: flex; align-items: center;
+      justify-content: space-between; min-height: 54px; gap: 16px;
     }
-    label {
-      display: block; font-size: 12px; font-weight: 600; color: #555;
-      text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 6px;
+    .o-breadcrumb {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 13px; color: #6c757d; flex-wrap: wrap;
+    }
+    .o-breadcrumb-item { cursor: default; }
+    .o-breadcrumb-item.active { color: #212529; font-weight: 500; }
+    .o-breadcrumb-sep { color: #adb5bd; font-size: 11px; }
+    .o-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+    /* Odoo-style buttons */
+    .btn {
+      padding: 5px 16px; border-radius: 4px; font-size: 13px;
+      font-family: inherit; font-weight: 400; cursor: pointer;
+      border: 1px solid transparent; transition: all 0.1s; white-space: nowrap;
+    }
+    .btn-primary { background: #017e84; color: white; border-color: #017e84; }
+    .btn-primary:hover { background: #016a6f; border-color: #016a6f; }
+    .btn-secondary { background: white; color: #212529; border-color: #dee2e6; }
+    .btn-secondary:hover { background: #f8f9fa; }
+    .btn-loading { opacity: 0.65; cursor: wait; }
+
+    /* Page content */
+    .o-content { padding: 24px; }
+
+    /* Odoo-style form sheet */
+    .o-sheet {
+      background: white; border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.08);
+      max-width: 680px; margin: 0 auto; overflow: hidden;
+    }
+    .o-sheet-header {
+      padding: 16px 24px 0; border-bottom: 1px solid #f0ede8; margin-bottom: 0;
+    }
+    .o-sheet-title { font-size: 18px; font-weight: 500; color: #212529; margin-bottom: 4px; }
+    .o-sheet-subtitle { font-size: 12px; color: #6c757d; padding-bottom: 14px; }
+    .o-sheet-body { padding: 20px 24px 24px; }
+
+    /* Odoo-style field groups */
+    .o-field-group { margin-bottom: 16px; }
+    .o-field-group:last-of-type { margin-bottom: 0; }
+    .o-label {
+      display: block; font-size: 12px; font-weight: 400;
+      color: rgba(0,0,0,0.45); margin-bottom: 4px;
     }
     select, input[type="date"] {
-      width: 100%; padding: 10px 12px; border: 1px solid #d0cec9;
-      border-radius: 6px; font-size: 14px; font-family: inherit;
-      background: white; margin-bottom: 16px;
+      width: 100%; padding: 5px 10px; border: 1px solid #dee2e6;
+      border-radius: 4px; font-size: 13.5px; font-family: inherit;
+      background: white; color: #212529; outline: none;
+      transition: border-color 0.1s;
     }
-    .row { display: flex; gap: 16px; }
-    .row > div { flex: 1; }
-    .btn-group { display: flex; gap: 8px; margin-top: 8px; }
-    button {
-      flex: 1; padding: 12px 20px; border: none; border-radius: 6px;
-      font-family: inherit; font-size: 14px; font-weight: 600;
-      cursor: pointer; transition: background 0.15s;
-    }
-    .btn-primary { background: #293750; color: white; }
-    .btn-primary:hover { background: #1e2b3d; }
-    .btn-secondary {
-      background: white; color: #293750; border: 1px solid #293750;
-    }
-    .btn-secondary:hover { background: #f0f0ee; }
-    .btn-loading { opacity: 0.7; cursor: wait; }
+    select:focus, input[type="date"]:focus { border-color: #017e84; }
+
+    .o-row { display: flex; gap: 16px; }
+    .o-row > .o-field-group { flex: 1; }
+
+    /* Result banner */
     .result {
-      background: #f0f4ff; border-left: 3px solid #406EEA;
-      padding: 14px 18px; border-radius: 0 6px 6px 0;
-      font-size: 13px; display: none;
+      background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460;
+      padding: 10px 16px; border-radius: 4px; font-size: 13px;
+      margin: 12px 24px 0; display: none;
     }
     .result.show { display: block; }
-    .result.error { background: #fff0f0; border-left-color: #d32f2f; }
+    .result.error { background: #f8d7da; border-color: #f5c6cb; color: #721c24; }
   </style>
 </head>
 <body>
-  <div class="header">
-    <div class="subtitle">Proseso Consulting</div>
-    <h1>Enhanced BIR Reports</h1>
-    <p>SLSP and QAP exports that include journal entries alongside vendor bills</p>
+
+  <!-- Odoo-style top navbar -->
+  <nav class="o-navbar">
+    <div class="o-navbar-logo">A</div>
+    <span class="o-navbar-app">Accounting</span>
+  </nav>
+
+  <!-- Odoo-style control panel -->
+  <div class="o-control-panel">
+    <div class="o-breadcrumb">
+      <span class="o-breadcrumb-item">Reporting</span>
+      <span class="o-breadcrumb-sep">›</span>
+      <span class="o-breadcrumb-item">Partner Reports</span>
+      <span class="o-breadcrumb-sep">›</span>
+      <span class="o-breadcrumb-item active">Enhanced BIR Reports</span>
+    </div>
+    <div class="o-actions">
+      <button type="button" class="btn btn-primary" id="btnXlsx">Download XLSX</button>
+      <button type="button" class="btn btn-secondary" id="btnDat">Download DAT</button>
+    </div>
   </div>
-  <div class="container">
-    <form id="exportForm" class="card">
-      <label>Report</label>
-      <select name="report_type">
-        <option value="slsp_purchases">SLSP — Purchases (SLP)</option>
-        <option value="slsp_sales">SLSP — Sales (SLS)</option>
-        <option value="qap">QAP — Quarterly Alphalist of Payees</option>
-      </select>
-      <label>Database</label>
-      <select name="db_name" id="dbSelect">
-        {% for client in clients %}
-        <option value="{{ client.db }}">{{ client.name }}</option>
-        {% endfor %}
-      </select>
-      <label>Company</label>
-      <select name="company_id" id="companySelect">
-        <option value="">Loading...</option>
-      </select>
-      <div class="row">
-        <div>
-          <label>Date From</label>
-          <input type="date" name="date_from" value="{{ default_date_from }}">
-        </div>
-        <div>
-          <label>Date To</label>
-          <input type="date" name="date_to" value="{{ default_date_to }}">
-        </div>
+
+  <!-- Page body -->
+  <div class="o-content">
+    <div class="o-sheet">
+      <div class="o-sheet-header">
+        <div class="o-sheet-title">Enhanced BIR Reports</div>
+        <div class="o-sheet-subtitle">SLSP and QAP exports that include journal entries alongside vendor bills</div>
       </div>
-      <div class="btn-group">
-        <button type="submit" name="format" value="xlsx" class="btn-primary">
-          Download XLSX
-        </button>
-        <button type="submit" name="format" value="dat" class="btn-secondary">
-          Download DAT
-        </button>
+      <div class="o-sheet-body">
+        <form id="exportForm">
+          <div class="o-field-group">
+            <label class="o-label">Report</label>
+            <select name="report_type">
+              <option value="slsp_purchases">SLSP — Purchases (SLP)</option>
+              <option value="slsp_sales">SLSP — Sales (SLS)</option>
+              <option value="qap">QAP — Quarterly Alphalist of Payees</option>
+            </select>
+          </div>
+          <div class="o-field-group">
+            <label class="o-label">Database</label>
+            <select name="db_name" id="dbSelect">
+              {% for client in clients %}
+              <option value="{{ client.db }}">{{ client.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="o-field-group">
+            <label class="o-label">Company</label>
+            <select name="company_id" id="companySelect">
+              <option value="">Loading...</option>
+            </select>
+          </div>
+          <div class="o-row">
+            <div class="o-field-group">
+              <label class="o-label">Date From</label>
+              <input type="date" name="date_from" value="{{ default_date_from }}">
+            </div>
+            <div class="o-field-group">
+              <label class="o-label">Date To</label>
+              <input type="date" name="date_to" value="{{ default_date_to }}">
+            </div>
+          </div>
+        </form>
+        <div id="result" class="result" style="margin: 12px 0 0;"></div>
       </div>
-    </form>
-    <div id="result" class="result"></div>
+    </div>
   </div>
   <script>
     function clearSelect(sel) {
@@ -133,19 +196,17 @@
     });
     loadCompanies(document.getElementById('dbSelect').value);
 
-    document.getElementById('exportForm').addEventListener('submit', async function(e) {
-      e.preventDefault();
-      var btn = e.submitter;
+    async function doExport(format) {
+      var btn = format === 'xlsx' ? document.getElementById('btnXlsx') : document.getElementById('btnDat');
       var origText = btn.textContent;
       var resultEl = document.getElementById('result');
       btn.textContent = 'Generating...';
       btn.classList.add('btn-loading');
       btn.disabled = true;
       resultEl.className = 'result';
-      resultEl.style.display = 'none';
 
-      var formData = new FormData(this);
-      formData.set('format', btn.value);
+      var formData = new FormData(document.getElementById('exportForm'));
+      formData.set('format', format);
 
       try {
         var resp = await fetch('./export', { method: 'POST', body: formData });
@@ -177,7 +238,10 @@
         btn.classList.remove('btn-loading');
         btn.disabled = false;
       }
-    });
+    }
+
+    document.getElementById('btnXlsx').addEventListener('click', function() { doExport('xlsx'); });
+    document.getElementById('btnDat').addEventListener('click', function() { doExport('dat'); });
   </script>
 </body>
 </html>
