@@ -1,5 +1,5 @@
 # cloudbuild.yaml
-# Triggered by push to main branch.
+# Triggered by push to master branch.
 # Builds Docker image, deploys to Cloud Run in asia-southeast1.
 steps:
   - name: 'gcr.io/cloud-builders/docker'

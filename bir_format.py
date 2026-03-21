@@ -110,8 +110,3 @@ def qap_dat_line(row: dict, seq: int) -> str:
     ]
     return ",".join(parts)
 
-
-def write_dat(lines: list[str], filepath: str) -> None:
-    """Write DAT lines to file with BIR-required encoding and line endings."""
-    with open(filepath, "w", encoding="cp1252", errors="replace", newline="") as f:
-        f.write("\r\n".join(lines) + "\r\n")

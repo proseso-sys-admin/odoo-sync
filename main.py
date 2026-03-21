@@ -27,7 +27,7 @@ from fastapi.templating import Jinja2Templates
 
 from odoo_client import (
     connect, fetch_posted_bills, fetch_journal_entries_with_wht,
-    fetch_partner_details, fetch_bill_lines_with_tax,
+    fetch_partner_details, fetch_partners_by_ids, fetch_bill_lines_with_tax,
     fetch_tax_details, classify_purchase, get_companies, get_semaphore,
 )
 from bir_format import clean_tin, clean_str
@@ -48,7 +48,7 @@ if not _ACCESS_TOKEN:
 
 def _check_token(token: str):
     """Return 404 for unknown tokens — avoids confirming service existence."""
-    if not _ACCESS_TOKEN or token != _ACCESS_TOKEN:
+    if token != _ACCESS_TOKEN:
         return JSONResponse({"detail": "Not found"}, status_code=404)
     return None
 
@@ -72,7 +72,7 @@ def _default_quarter_dates() -> tuple[str, str]:
     return str(q_start), str(q_end)
 
 
-def _extract_slsp_rows(conn, moves, report_type, source_label):
+def _extract_slsp_rows(conn, moves, report_type, source_label, partners_cache=None):
     """Convert fetched moves (bills or JEs) into cleaned SLSP rows."""
     rows = []
     for move in moves:
@@ -82,7 +82,10 @@ def _extract_slsp_rows(conn, moves, report_type, source_label):
             if not partner_id:
                 continue
             pid = partner_id[0] if isinstance(partner_id, list) else partner_id
-            partner = fetch_partner_details(conn, pid)
+            if partners_cache is not None and pid in partners_cache:
+                partner = partners_cache[pid]
+            else:
+                partner = fetch_partner_details(conn, pid)
             tax_details = line.get("tax_details") or fetch_tax_details(conn, line.get("tax_ids", []))
             for tax in tax_details:
                 use = tax.get("type_tax_use", "")
@@ -131,7 +134,7 @@ def _extract_slsp_rows(conn, moves, report_type, source_label):
     return rows
 
 
-def _extract_qap_rows(conn, moves, source_label):
+def _extract_qap_rows(conn, moves, source_label, partners_cache=None):
     """Convert fetched moves (bills or JEs) into cleaned QAP rows."""
     rows = []
     for move in moves:
@@ -141,7 +144,10 @@ def _extract_qap_rows(conn, moves, source_label):
             if not partner_id:
                 continue
             pid = partner_id[0] if isinstance(partner_id, list) else partner_id
-            partner = fetch_partner_details(conn, pid)
+            if partners_cache is not None and pid in partners_cache:
+                partner = partners_cache[pid]
+            else:
+                partner = fetch_partner_details(conn, pid)
             tax_details = line.get("tax_details") or fetch_tax_details(conn, line.get("tax_ids", []))
             for tax in tax_details:
                 atc = tax.get("l10n_ph_atc")
@@ -244,8 +250,14 @@ def export_report(
                 )
                 bills = fetch_posted_bills(conn, move_types, date_from, date_to)
                 jes = fetch_journal_entries_with_wht(conn, date_from, date_to)
-                bill_rows = _extract_slsp_rows(conn, bills, slsp_type, "bill")
-                je_rows = _extract_slsp_rows(conn, jes, slsp_type, "journal_entry")
+                _all_slsp_pids = set()
+                for _m in bills + jes:
+                    _pid = _m.get("partner_id")
+                    if _pid:
+                        _all_slsp_pids.add(_pid[0] if isinstance(_pid, list) else _pid)
+                slsp_partners = fetch_partners_by_ids(conn, list(_all_slsp_pids))
+                bill_rows = _extract_slsp_rows(conn, bills, slsp_type, "bill", slsp_partners)
+                je_rows = _extract_slsp_rows(conn, jes, slsp_type, "journal_entry", slsp_partners)
                 merged = build_slsp_rows(bill_rows, je_rows)
 
                 summary = f"{len(bill_rows)} bills + {len(je_rows)} journal entries = {len(merged)} total"
@@ -277,8 +289,14 @@ def export_report(
             elif report_type == "qap":
                 bills = fetch_posted_bills(conn, ["in_invoice", "in_refund"], date_from, date_to)
                 jes = fetch_journal_entries_with_wht(conn, date_from, date_to)
-                bill_rows = _extract_qap_rows(conn, bills, "bill")
-                je_rows = _extract_qap_rows(conn, jes, "journal_entry")
+                _all_qap_pids = set()
+                for _m in bills + jes:
+                    _pid = _m.get("partner_id")
+                    if _pid:
+                        _all_qap_pids.add(_pid[0] if isinstance(_pid, list) else _pid)
+                qap_partners = fetch_partners_by_ids(conn, list(_all_qap_pids))
+                bill_rows = _extract_qap_rows(conn, bills, "bill", qap_partners)
+                je_rows = _extract_qap_rows(conn, jes, "journal_entry", qap_partners)
                 merged = build_qap_rows(bill_rows, je_rows)
 
                 summary = f"{len(bill_rows)} bills + {len(je_rows)} journal entries = {len(merged)} total"
