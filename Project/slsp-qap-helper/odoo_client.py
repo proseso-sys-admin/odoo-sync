@@ -62,7 +62,7 @@ def _execute(conn: OdooConnection, model: str, method: str, args: list, call_kwa
         ctx = dict(kw.get("context", {}))
         ctx["allowed_company_ids"] = [conn.company_id]
         kw["context"] = ctx
-    return conn.models.execute_kw(conn.db, conn.uid, conn.api_key, model, args, method, kw)
+    return conn.models.execute_kw(conn.db, conn.uid, conn.api_key, model, method, args, kw)
 
 
 def fetch_posted_bills(

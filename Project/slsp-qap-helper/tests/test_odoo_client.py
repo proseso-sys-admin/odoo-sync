@@ -46,7 +46,7 @@ class TestFetchPostedBills:
         assert len(bills) == 1
         assert bills[0]["name"] == "BILL/2026/0001"
         call_args = mock_conn.models.execute_kw.call_args
-        domain = call_args[0][4][0]
+        domain = call_args[0][5][0]
         assert ("move_type", "in", ["in_invoice", "in_refund"]) in domain
         assert ("state", "=", "posted") in domain
 
