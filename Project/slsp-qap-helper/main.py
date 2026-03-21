@@ -34,7 +34,7 @@ from odoo_client import (
     fetch_tax_details, classify_purchase, get_companies, get_semaphore,
     fetch_client_tasks,
 )
-from bir_format import clean_tin, clean_str
+from bir_format import clean_tin, clean_branch_code, clean_str
 from slsp_builder import build_slsp_rows, write_slsp_xlsx, write_slsp_dat
 from qap_builder import build_qap_rows, write_qap_xlsx, write_qap_dat
 
@@ -272,7 +272,9 @@ def export_report(
 
     companies = get_companies(conn)
     selected = next((c for c in companies if c["id"] == company_id), {})
-    filing_tin = clean_tin(selected.get("vat", ""))
+    raw_vat = selected.get("vat", "")
+    filing_tin = clean_tin(raw_vat)
+    branch_code = clean_branch_code(raw_vat)
 
     with get_semaphore(client["db"]):
         try:
@@ -366,12 +368,15 @@ def export_report(
                 filename = f"QAP_{date_from}_to_{date_to}_{safe_db}"
 
                 if format == "dat":
+                    # BIR filename: <TIN><BC><MMYYYY><FormType>.DAT  e.g. 005302695000003202 61601EQ.DAT
+                    qap_year, qap_month = date_to[:4], date_to[5:7]
+                    qap_dat_name = f"{filing_tin}{branch_code}{qap_month}{qap_year}1601EQ.DAT"
                     content = write_qap_dat(merged)
                     return StreamingResponse(
                         io.BytesIO(content.encode("cp1252", errors="replace")),
                         media_type="application/octet-stream",
                         headers={
-                            "Content-Disposition": f'attachment; filename="{filename}.dat"',
+                            "Content-Disposition": f'attachment; filename="{qap_dat_name}"',
                             "X-Export-Summary": quote(summary),
                         },
                     )

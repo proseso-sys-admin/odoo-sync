@@ -16,6 +16,16 @@ def clean_tin(raw: str | None) -> str:
     return digits[:9].ljust(9, "0")
 
 
+def clean_branch_code(raw: str | None) -> str:
+    """Extract 4-digit branch code from VAT (digits 10-13).
+    Philippine TIN format: NNN-NNN-NNN-BBBB — branch code follows the 9-digit TIN.
+    Returns '0000' (head office) if not present.
+    """
+    digits = "".join(c for c in str(raw or "") if c.isdigit())
+    bc = digits[9:13] if len(digits) >= 13 else ""
+    return bc.ljust(4, "0") if bc else "0000"
+
+
 def clean_str(raw: str | None, max_len: int = 50) -> str:
     """Uppercase, sanitize special chars, collapse whitespace, truncate."""
     s = str(raw or "").upper()
