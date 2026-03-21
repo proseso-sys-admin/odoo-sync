@@ -117,7 +117,7 @@
       clearSelect(sel);
       addOption(sel, '', 'Loading...');
       try {
-        var resp = await fetch('companies?db=' + encodeURIComponent(db));
+        var resp = await fetch('./companies?db=' + encodeURIComponent(db));
         var companies = await resp.json();
         clearSelect(sel);
         companies.forEach(function(c) {
@@ -148,7 +148,7 @@
       formData.set('format', btn.value);
 
       try {
-        var resp = await fetch('export', { method: 'POST', body: formData });
+        var resp = await fetch('./export', { method: 'POST', body: formData });
         if (!resp.ok) {
           var err = await resp.json();
           throw new Error(err.detail || 'Export failed');

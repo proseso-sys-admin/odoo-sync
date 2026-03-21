@@ -144,13 +144,22 @@ def fetch_partner_details(conn: OdooConnection, partner_id: int) -> dict:
     return result[0] if result else {}
 
 
+def fetch_partners_by_ids(conn: OdooConnection, partner_ids: list[int]) -> dict[int, dict]:
+    """Fetch multiple partners at once. Returns {id: partner_dict}."""
+    if not partner_ids:
+        return {}
+    FIELDS = ["id", "vat", "name", "last_name", "first_name", "middle_name", "street", "city"]
+    results = _execute(conn, "res.partner", "read", [partner_ids], {"fields": FIELDS})
+    return {r["id"]: r for r in results}
+
+
 def classify_purchase(conn: OdooConnection, account_id: int) -> str:
     """Map an account to SLSP purchase category based on account code prefix."""
     result = _execute(
         conn, "account.account", "read",
         [[account_id]], {"fields": ["code"]}
     )
-    code = result[0]["code"] if result else ""
+    code = result[0].get("code") or "" if result else ""
     if code.startswith("1"):
         return "capital_goods"
     elif code.startswith("6"):
