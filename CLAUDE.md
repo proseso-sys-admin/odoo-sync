@@ -59,9 +59,15 @@ Optional:
 
 ### Deployment
 
-Push to `master` on `https://github.com/proseso-sys-admin/odoo-sync` triggers Cloud Build (`worker/cloudbuild.yaml`) → builds image → deploys to Cloud Run in `asia-southeast1`.
+Push to `master` triggers Cloud Build (`worker/cloudbuild.yaml`) → builds image → deploys to Cloud Run in `asia-southeast1`.
 
-`gh` CLI is available and authenticated. Pushing directly to `master` is allowed.
+### Deploy flow
+1. Push to feature branch → open PR
+2. `odoo-sync-pr-check` runs (npm ci + syntax check)
+3. PR check must pass before merge (branch protection)
+4. Merge to `master` → deploy trigger fires → Cloud Run updated
+
+`gh` CLI is available and authenticated. Direct `master` push is allowed but PRs are recommended.
 
 ## Smoke Testing
 
