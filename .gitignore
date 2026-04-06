@@ -25,3 +25,6 @@ build/
 
 # Optional: uncomment if you keep plan files local
 # .cursor/
+
+# Backup
+.git.bak/
